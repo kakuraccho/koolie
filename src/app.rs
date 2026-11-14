@@ -6,7 +6,7 @@ use crate::discover::{self, Candidate, ProbeResult};
 use crate::model::{Agent, AgentKey, AgentStatus, HostId, Inventory, ServerKind, console_order};
 use crate::notify::{self, Tracker};
 use crate::session::{self, ConnState, Connector, HostConnector, HostHandle, HostUpdate};
-use crate::transcript::{self, Conversation, Harness, TranscriptParser};
+use crate::transcript::{self, Conversation, Follower, Harness};
 use crate::transport::{SshTransport, Transport};
 use crate::ui::text::TextInput;
 use crate::usage::UsageReport;
@@ -143,6 +143,8 @@ pub struct DetailState {
     pub snippet_picker: Option<usize>,
     poller: Option<JoinHandle<()>>,
     chat_poller: Option<JoinHandle<()>>,
+    /// The agent session the chat poller follows.
+    chat_session: Option<crate::model::AgentSession>,
 }
 
 impl Drop for DetailState {
@@ -495,6 +497,7 @@ impl App {
                     h.inventory = Some(inventory);
                 }
                 self.clamp_selection();
+                self.restart_chat_if_session_changed();
             }
             HostUpdate::StatusChanged { .. } => {}
         }
@@ -686,9 +689,11 @@ impl App {
             snippet_picker: None,
             poller: None,
             chat_poller: None,
+            chat_session: None,
         };
         d.poller = Some(self.spawn_peek(key.clone()));
         if mode == DetailMode::Chat {
+            d.chat_session = self.agent(&key).and_then(|a| a.session.clone());
             d.chat_poller = Some(self.spawn_chat(key));
         }
         self.detail = Some(d);
@@ -760,13 +765,12 @@ impl App {
                 )));
                 return;
             };
-            let mut path = None;
-            let mut parser = TranscriptParser::new(harness);
-            let mut offset: u64 = 0;
+            let mut follower: Option<Follower> = None;
+            let mut sent_once = false;
             loop {
-                if path.is_none() {
+                if follower.is_none() {
                     match transcript::locate(transport.as_ref(), &session).await {
-                        Ok(p) => path = Some(p),
+                        Ok(p) => follower = Some(Follower::new(harness, p)),
                         Err(e) => {
                             if !send(Err(chat_error_text(&e))) {
                                 return;
@@ -774,19 +778,18 @@ impl App {
                         }
                     }
                 }
-                if let Some(p) = &path {
-                    match transcript::read_from(transport.as_ref(), p, offset).await {
-                        Ok(bytes) => {
-                            let n = bytes.len() as u64;
-                            if n > 0 || offset == 0 {
-                                parser.feed(&bytes);
-                                offset += n;
-                                if !send(Ok(parser.conversation().clone())) {
-                                    return;
-                                }
+                if let Some(f) = follower.as_mut() {
+                    match f.poll(transport.as_ref()).await {
+                        Ok(changed) => {
+                            if (changed || !sent_once) && !send(Ok(f.conversation().clone())) {
+                                return;
                             }
+                            sent_once = true;
                         }
                         Err(e) => {
+                            if e == transcript::TranscriptError::NotFound {
+                                follower = None;
+                            }
                             if !send(Err(chat_error_text(&e))) {
                                 return;
                             }
@@ -919,6 +922,11 @@ impl App {
     }
 
     fn toggle_mode(&mut self) {
+        let session = self
+            .detail
+            .as_ref()
+            .and_then(|d| self.agent(&d.key))
+            .and_then(|a| a.session.clone());
         let chat_poller = match self.detail.as_ref() {
             Some(d) if d.mode == DetailMode::Peek && d.chat_poller.is_none() => {
                 Some(self.spawn_chat(d.key.clone()))
@@ -932,7 +940,33 @@ impl App {
             };
             if chat_poller.is_some() {
                 d.chat_poller = chat_poller;
+                d.chat_session = session;
             }
+        }
+    }
+
+    /// Follow the new transcript when the agent started another session
+    /// (Claude Code's `/clear`, Codex's new thread).
+    fn restart_chat_if_session_changed(&mut self) {
+        let Some(d) = self.detail.as_ref() else {
+            return;
+        };
+        if d.chat_poller.is_none() {
+            return;
+        }
+        let current = self.agent(&d.key).and_then(|a| a.session.clone());
+        if current.is_none() || current == d.chat_session {
+            return;
+        }
+        let handle = self.spawn_chat(d.key.clone());
+        if let Some(d) = self.detail.as_mut() {
+            if let Some(old) = d.chat_poller.replace(handle) {
+                old.abort();
+            }
+            d.chat_session = current;
+            d.chat = None;
+            d.chat_error = None;
+            d.chat_scroll = 0;
         }
     }
 

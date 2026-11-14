@@ -1024,8 +1024,7 @@ mod tests {
                     ],
                     answer: Some("直しました".into()),
                     in_progress: false,
-                    started_at: None,
-                    ended_at: None,
+                    ..Default::default()
                 },
                 Turn {
                     prompt: Some("次".into()),
@@ -1035,10 +1034,10 @@ mod tests {
                     }],
                     answer: None,
                     in_progress: true,
-                    started_at: None,
-                    ended_at: None,
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let text: Vec<String> = chat_lines(&c, 40)
             .iter()

@@ -141,7 +141,7 @@ pub async fn run(
                 input.pause();
                 leave();
                 println!(
-                    "\r\nkoolie: {} を実行します（herdr のデタッチ操作で戻ります）\r",
+                    "\r\nkoolie: {} を実行します（戻るときは herdr のデタッチ操作: 通常は Ctrl+B → q）\r",
                     argv.join(" ")
                 );
                 let status = tokio::process::Command::new(&argv[0])
