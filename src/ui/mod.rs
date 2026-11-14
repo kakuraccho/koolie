@@ -142,13 +142,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.view {
         View::Console if app.console.searching => "入力して検索  Enter 確定  Esc 取消",
         View::Console => {
-            "j/k 移動  Enter 開く  c チャット  a 端末に入る  / 検索  n 要対応  b/d/w/i 状態  h ホスト絞込  H ホスト  u 使用量  ? ヘルプ  q 終了"
+            "j/k 移動  Enter 開く  c チャット  a 端末へ  / 検索  n 要対応  h ホスト絞込  H ホスト  u 使用量  ? ヘルプ  q 終了"
         }
         View::Detail => match app.detail.as_ref().map(|d| d.focus) {
             Some(Focus::Compose) => {
-                "Enter 送信  Alt+Enter 改行  Ctrl+T スニペット  Esc 入力をやめる"
+                "Enter 送信  Alt+Enter 改行  Tab 画面/チャット  PgUp/PgDn スクロール  Ctrl+T スニペット  Esc 操作モード"
             }
-            _ => "i 入力  Tab 画面/チャット  a 端末に入る  x 中断(Esc)  j/k スクロール  Esc 戻る",
+            _ => "i 入力  Tab 画面/チャット  a 端末へ  x 中断  j/k スクロール  Esc/q 一覧へ",
         },
         View::Hosts => match app.hosts_view.add {
             Some(AddStep::Choose { .. }) => {

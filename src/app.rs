@@ -667,10 +667,14 @@ impl App {
     }
 
     pub fn open_detail(&mut self, key: AgentKey, mode: DetailMode) {
+        let blocked = self
+            .agent(&key)
+            .is_some_and(|a| a.status == AgentStatus::Blocked);
         let mut d = DetailState {
             key: key.clone(),
             mode,
-            focus: Focus::View,
+            // Type right away; while blocked, keys answer the dialog instead.
+            focus: if blocked { Focus::View } else { Focus::Compose },
             screen: None,
             screen_error: None,
             scroll: 0,
@@ -745,13 +749,15 @@ impl App {
             };
             let Some(transport) = transport else { return };
             let Some(session) = session else {
-                send(Err(transcript::TranscriptError::NoSession.to_string()));
+                send(Err(chat_error_text(
+                    &transcript::TranscriptError::NoSession,
+                )));
                 return;
             };
             let Some(harness) = Harness::from_agent(&session.agent) else {
-                send(Err(
-                    transcript::TranscriptError::UnsupportedAgent.to_string()
-                ));
+                send(Err(chat_error_text(
+                    &transcript::TranscriptError::UnsupportedAgent,
+                )));
                 return;
             };
             let mut path = None;
@@ -762,7 +768,7 @@ impl App {
                     match transcript::locate(transport.as_ref(), &session).await {
                         Ok(p) => path = Some(p),
                         Err(e) => {
-                            if !send(Err(e.to_string())) {
+                            if !send(Err(chat_error_text(&e))) {
                                 return;
                             }
                         }
@@ -781,7 +787,7 @@ impl App {
                             }
                         }
                         Err(e) => {
-                            if !send(Err(e.to_string())) {
+                            if !send(Err(chat_error_text(&e))) {
                                 return;
                             }
                         }
@@ -849,7 +855,9 @@ impl App {
                 KeyCode::Down => d.composer.vertical(1),
                 KeyCode::Home => d.composer.home(),
                 KeyCode::End => d.composer.end(),
-                KeyCode::Tab => d.composer.insert('\t'),
+                KeyCode::PageUp => scroll(d, 20),
+                KeyCode::PageDown => scroll(d, -20),
+                KeyCode::Tab => self.toggle_mode(),
                 KeyCode::Char(c) if !ctrl => d.composer.insert(c),
                 _ => {}
             }
@@ -887,9 +895,7 @@ impl App {
         }
         let d = self.detail.as_mut().expect("checked");
         match k.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Char('h') => {
-                self.close_detail()
-            }
+            KeyCode::Esc | KeyCode::Char('q') => self.close_detail(),
             KeyCode::Char('i') | KeyCode::Enter => d.focus = Focus::Compose,
             KeyCode::Tab | KeyCode::Char('c') => self.toggle_mode(),
             KeyCode::Char('a') => self.request_attach(&key),
@@ -1307,7 +1313,7 @@ impl App {
         let mut seen_routes: Vec<Vec<String>> = Vec::new();
         let mut targets: Vec<(HostId, Arc<dyn Transport>, bool)> = Vec::new();
         for h in &self.hosts {
-            if h.cfg.is_local() {
+            if h.cfg.is_local() || h.handle.transport().is_local() {
                 if seen_local {
                     continue;
                 }
@@ -1386,6 +1392,21 @@ impl App {
         for h in &self.hosts {
             h.handle.shutdown().await;
         }
+    }
+}
+
+/// User-facing text for a Chat problem.
+pub fn chat_error_text(e: &transcript::TranscriptError) -> String {
+    use transcript::TranscriptError as E;
+    match e {
+        E::UnsupportedAgent => {
+            "このエージェントのチャット表示には対応していません（Claude Code と Codex のみ）".into()
+        }
+        E::NoSession => "herdr がこのエージェントのセッションを報告していません。ホストで `herdr integration install claude`（Codex なら codex）を実行し、エージェントを起動し直してください".into(),
+        E::NotFound => {
+            "会話の記録ファイルがまだ見つかりません（最初のメッセージのあとに作られます）".into()
+        }
+        other => other.to_string(),
     }
 }
 
