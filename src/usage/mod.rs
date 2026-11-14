@@ -31,8 +31,14 @@ pub struct UsageReport {
     pub rows: Vec<UsageRow>,
 }
 
-/// Scan the transcripts under `home` for the last `days` days.
-pub fn scan(_home: &std::path::Path, days: u32) -> anyhow::Result<UsageReport> {
+/// Scan the transcripts under `home` for the last `days` days. Days are
+/// local dates at `utc_offset` (compute it once at startup, before threads
+/// start: `time`'s local-offset lookup is unreliable in threaded programs).
+pub fn scan(
+    _home: &std::path::Path,
+    days: u32,
+    _utc_offset: time::UtcOffset,
+) -> anyhow::Result<UsageReport> {
     Ok(UsageReport {
         version: 1,
         generated_at: 0,
