@@ -814,8 +814,18 @@ fn fmt_tot(t: Tot) -> String {
         "{:>8}  ${:>8.2}{}",
         fmt_tokens(t.tokens),
         t.cost,
-        if t.unpriced { "+" } else { "" }
+        if t.unpriced { "+" } else { " " }
     )
+}
+
+/// Pad to `w` display columns (left-aligned).
+fn pad_right(s: &str, w: usize) -> String {
+    format!("{s}{}", " ".repeat(w.saturating_sub(str_width(s))))
+}
+
+/// Pad to `w` display columns (right-aligned).
+fn pad_left(s: &str, w: usize) -> String {
+    format!("{}{s}", " ".repeat(w.saturating_sub(str_width(s))))
 }
 
 fn draw_usage(f: &mut Frame, app: &App, area: Rect) {
@@ -873,13 +883,19 @@ fn draw_usage(f: &mut Frame, app: &App, area: Rect) {
         add_row(by_day.entry(r.date.as_str()).or_default(), r);
     }
     lines.push(Line::styled(
-        format!(" {:<12} {:>20}  {:>20}  {:>20}", "", "今日", "7日", "30日"),
+        format!(
+            " {} {}  {}  {}",
+            pad_right("", 12),
+            pad_left("今日", 20),
+            pad_left("7日", 20),
+            pad_left("30日", 20)
+        ),
         Style::new().fg(DIM),
     ));
     for (p, t) in &by_prog {
         lines.push(Line::raw(format!(
-            " {:<12} {}  {}  {}",
-            p,
+            " {} {}  {}  {}",
+            pad_right(p, 12),
             fmt_tot(t[0]),
             fmt_tot(t[1]),
             fmt_tot(t[2])
@@ -887,8 +903,8 @@ fn draw_usage(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::styled(
         format!(
-            " {:<12} {}  {}  {}",
-            "合計",
+            " {} {}  {}  {}",
+            pad_right("合計", 12),
             fmt_tot(all[0]),
             fmt_tot(all[1]),
             fmt_tot(all[2])
@@ -905,9 +921,9 @@ fn draw_usage(f: &mut Frame, app: &App, area: Rect) {
     });
     for ((p, m), t) in models.iter().take(8) {
         lines.push(Line::raw(format!(
-            " {:<8} {:<32} {}",
-            p,
-            truncate(m, 32),
+            " {} {} {}",
+            pad_right(p, 8),
+            pad_right(&truncate(m, 32), 32),
             fmt_tot(*t)
         )));
     }
