@@ -2,6 +2,8 @@
 name = "koolie"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+description = "Terminal console for coding agents running in herdr, here and on other machines"
 
 [dependencies]
 ansi-to-tui = "8.0.1"
