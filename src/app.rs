@@ -713,9 +713,13 @@ impl App {
             let mut last_rev = None;
             loop {
                 if let Some(b) = handle.backend() {
-                    let r = b
-                        .read(&key.id, ReadSource::Recent, Some(PEEK_LINES), true)
-                        .await;
+                    // herdr-core scrolls a full-screen program to read its
+                    // history, so periodic previews read only the screen there.
+                    let (source, lines) = match b.kind() {
+                        ServerKind::HerdrCore => (ReadSource::Visible, None),
+                        ServerKind::HerdrTui => (ReadSource::Recent, Some(PEEK_LINES)),
+                    };
+                    let r = b.read(&key.id, source, lines, true).await;
                     let changed = match &r {
                         Ok(s) => last_rev != Some(s.revision) || s.revision == 0,
                         Err(_) => true,
@@ -1067,6 +1071,10 @@ impl App {
             self.toast("ホストに接続されていません");
             return;
         };
+        if is_own_pane(&h.cfg, &key.id) {
+            self.toast("koolie 自身が動いているペインです");
+            return;
+        }
         let argv = h
             .handle
             .transport()
@@ -1426,6 +1434,22 @@ impl App {
         for h in &self.hosts {
             h.handle.shutdown().await;
         }
+    }
+}
+
+/// Whether `pane` is the herdr pane koolie itself runs in (attaching to it
+/// would nest koolie inside itself).
+pub fn is_own_pane(cfg: &HostConfig, pane: &str) -> bool {
+    if !cfg.is_local() || cfg.kind != ServerKind::HerdrTui {
+        return false;
+    }
+    let own_pane = std::env::var("HERDR_PANE_ID").ok();
+    let own_sock = std::env::var("HERDR_SOCKET_PATH").ok();
+    match (own_pane, own_sock, cfg.socket.as_deref()) {
+        (Some(p), Some(s), Some(cfg_sock)) => {
+            p == pane && std::fs::canonicalize(&s).ok() == std::fs::canonicalize(cfg_sock).ok()
+        }
+        _ => false,
     }
 }
 

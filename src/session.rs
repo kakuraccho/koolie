@@ -131,6 +131,9 @@ impl Connector for HostConnector {
                 let probe =
                     if cfg.is_local() && cfg.kind == ServerKind::HerdrTui && cfg.socket.is_some() {
                         discover::ProbeResult::default()
+                    } else if cfg.kind == ServerKind::HerdrCore {
+                        discover::probe_core_session(self.transport.as_ref(), cfg.session_name())
+                            .await?
                     } else {
                         discover::probe(self.transport.as_ref()).await?
                     };
