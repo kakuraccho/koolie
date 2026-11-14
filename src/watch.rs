@@ -52,6 +52,11 @@ pub struct AgentLine {
     pub status: AgentStatus,
 }
 
+/// How long `watch` waits before retrying a host that stopped on its own.
+const FAILED_RETRY: Duration = Duration::from_secs(60);
+/// The same for authentication / host-key failures.
+const FAILED_AUTH_RETRY: Duration = Duration::from_secs(600);
+
 pub fn status_path() -> PathBuf {
     runtime_dir().join("status.json")
 }
@@ -143,6 +148,12 @@ pub async fn watch(
         hosts.len()
     );
     write_status(&build_status(&states, &inventories));
+    // When each Failed host last failed, for the periodic retry.
+    let mut failed_at: BTreeMap<HostId, (tokio::time::Instant, bool)> = BTreeMap::new();
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     loop {
         tokio::select! {
             u = rx.recv() => {
@@ -151,6 +162,16 @@ pub async fn watch(
                     HostUpdate::State { host, state } => {
                         if !state.is_connected() {
                             tracker.reset_host(&host);
+                            // Agents of a host we cannot see are not counted.
+                            inventories.remove(&host);
+                        }
+                        match &state {
+                            ConnState::Failed { auth, .. } => {
+                                failed_at.insert(host.clone(), (tokio::time::Instant::now(), *auth));
+                            }
+                            _ => {
+                                failed_at.remove(&host);
+                            }
                         }
                         if let Some(e) = state.error().filter(|e| !e.is_empty()) {
                             eprintln!("[{host}] {}: {e}", state.label());
@@ -172,8 +193,25 @@ pub async fn watch(
                 }
                 write_status(&build_status(&states, &inventories));
             }
-            _ = heartbeat.tick() => write_status(&build_status(&states, &inventories)),
-            _ = tokio::signal::ctrl_c() => break,
+            _ = heartbeat.tick() => {
+                // Nobody is there to press Reconnect: retry failed hosts on a
+                // slow clock (authentication failures much slower, so a
+                // locked-out key does not trip fail2ban).
+                let now = tokio::time::Instant::now();
+                for (host, (at, auth)) in failed_at.iter_mut() {
+                    let wait = if *auth { FAILED_AUTH_RETRY } else { FAILED_RETRY };
+                    if now.duration_since(*at) >= wait
+                        && let Some(h) = handles.iter().find(|h| &h.id == host)
+                    {
+                        *at = now;
+                        h.reconnect();
+                    }
+                }
+                write_status(&build_status(&states, &inventories));
+            }
+            _ = &mut ctrl_c => break,
+            _ = term.recv() => break,
+            _ = hup.recv() => break,
         }
     }
     for h in &handles {

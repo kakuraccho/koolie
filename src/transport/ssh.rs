@@ -67,9 +67,15 @@ impl SshTransport {
                     '_'
                 }
             })
-            .take(40)
+            .take(24)
             .collect();
-        format!("{safe}-{}", std::process::id())
+        // The hash keeps names that sanitize alike (`自宅` / `会社`,
+        // `box.lan` / `box_lan`) apart.
+        format!(
+            "{safe}-{:08x}-{}",
+            fnv1a(&self.host) as u32,
+            std::process::id()
+        )
     }
 
     fn control_path(&self) -> PathBuf {
@@ -263,6 +269,13 @@ impl Transport for SshTransport {
             return Ok(stream);
         }
         let local = self.forward_path(host_socket);
+        // A forward this master already has (an earlier call was cancelled
+        // after `-O forward` but before recording it) is simply reused:
+        // unlinking it would break it for good.
+        if let Ok(stream) = UnixStream::connect(&local).await {
+            st.forwards.insert(host_socket.to_string(), local.clone());
+            return Ok(stream);
+        }
         let _ = std::fs::remove_file(&local);
         let spec = format!("{}:{}", local.display(), host_socket);
         let out = run_command(
@@ -454,6 +467,14 @@ mod tests {
         assert!(i.contains(&"-t".to_string()));
         assert_eq!(i.last().unwrap(), "herdr agent attach w1:p1");
         assert!(t.control_path().to_string_lossy().contains("my_host-"));
+        // Names that sanitize alike still get their own files.
+        let a = SshTransport::with_ssh_bin("自宅", vec!["a".into()], "ssh".into());
+        let b = SshTransport::with_ssh_bin("会社", vec!["b".into()], "ssh".into());
+        assert_ne!(a.control_path(), b.control_path());
+        let c = SshTransport::with_ssh_bin("box.lan", vec!["a".into()], "ssh".into());
+        let d = SshTransport::with_ssh_bin("box_lan", vec!["b".into()], "ssh".into());
+        assert_ne!(c.control_path(), d.control_path());
+        assert_ne!(c.forward_path("/s"), d.forward_path("/s"));
     }
 
     /// A fake `ssh` that runs the remote command locally, so exec can be

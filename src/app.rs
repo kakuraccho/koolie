@@ -20,6 +20,8 @@ use tokio::task::JoinHandle;
 const PEEK_INTERVAL: Duration = Duration::from_millis(700);
 const CHAT_INTERVAL: Duration = Duration::from_millis(1500);
 const PEEK_LINES: u32 = 400;
+/// How long a dialog must have been visible before answer keys reach it.
+const ANSWER_DELAY: Duration = Duration::from_millis(700);
 
 /// Messages into the app loop.
 #[derive(Debug)]
@@ -39,7 +41,10 @@ pub enum AppMsg {
         key: AgentKey,
         ok: bool,
         message: String,
-        clear_draft: bool,
+        /// On success, remove this text from the draft (what was sent).
+        sent: Option<String>,
+        /// The composer's own send finished (clears `busy`).
+        from_composer: bool,
     },
     Usage {
         host: HostId,
@@ -51,6 +56,8 @@ pub enum AppMsg {
         result: Result<ProbeResult, String>,
     },
     Tick,
+    /// SIGTERM / SIGHUP: leave cleanly.
+    Quit,
 }
 
 /// One configured host as the app sees it.
@@ -107,6 +114,8 @@ impl Filter {
 #[derive(Debug, Default)]
 pub struct ConsoleState {
     pub selected: usize,
+    /// The agent the cursor is on; the cursor follows it when rows re-sort.
+    pub pinned: Option<AgentKey>,
     pub filter: Filter,
     pub host_filter: Option<HostId>,
     pub search: String,
@@ -145,6 +154,11 @@ pub struct DetailState {
     chat_poller: Option<JoinHandle<()>>,
     /// The agent session the chat poller follows.
     chat_session: Option<crate::model::AgentSession>,
+    /// Since when the agent has been seen blocked. Answer keys only go to
+    /// the agent once the dialog has been on screen a moment, so a key meant
+    /// for koolie (scrolling, Enter) never lands in a dialog that just
+    /// appeared.
+    pub blocked_since: Option<Instant>,
 }
 
 impl Drop for DetailState {
@@ -425,12 +439,21 @@ impl App {
                 key,
                 ok,
                 message,
-                clear_draft,
+                sent,
+                from_composer,
             } => {
                 if let Some(d) = self.detail.as_mut().filter(|d| d.key == key) {
-                    d.busy = false;
-                    if ok && clear_draft {
-                        d.composer.clear();
+                    if from_composer {
+                        d.busy = false;
+                    }
+                    // Remove only what was sent; keep anything typed since.
+                    if ok && let Some(sent) = sent {
+                        let now = d.composer.text();
+                        if now.trim_end_matches('\n') == sent {
+                            d.composer.clear();
+                        } else if let Some(rest) = now.strip_prefix(&sent) {
+                            d.composer.set(rest.trim_start_matches('\n'));
+                        }
                     }
                 }
                 self.toast(message);
@@ -449,6 +472,7 @@ impl App {
                 }
             }
             AppMsg::Probed { target, result } => self.on_probed(target, result),
+            AppMsg::Quit => self.quit = true,
             AppMsg::Tick => {
                 self.spinner = self.spinner.wrapping_add(1);
                 if self
@@ -484,8 +508,12 @@ impl App {
                     .then(|| self.detail.as_ref().map(|d| d.key.clone()))
                     .flatten();
                 let notes = self.tracker.observe(&host, &inventory, viewing.as_ref());
+                // A running `koolie watch` already delivers these.
+                let watcher = !notes.is_empty() && crate::watch::read_live_status().is_some();
                 for n in &notes {
-                    notify::deliver(&self.cfg.notify, n);
+                    if !watcher {
+                        notify::deliver(&self.cfg.notify, n);
+                    }
                     if self.cfg.notify.sinks.contains(&Sink::Bell) {
                         self.bell = true;
                     }
@@ -498,16 +526,37 @@ impl App {
                 }
                 self.clamp_selection();
                 self.restart_chat_if_session_changed();
+                self.track_blocked();
             }
             HostUpdate::StatusChanged { .. } => {}
         }
     }
 
+    /// Keep the cursor on the same agent when the rows change; clamp when
+    /// that agent is gone.
     fn clamp_selection(&mut self) {
-        let n = self.rows().len();
-        if self.console.selected >= n {
-            self.console.selected = n.saturating_sub(1);
-        }
+        let rows = self.rows();
+        let pos = self
+            .console
+            .pinned
+            .as_ref()
+            .and_then(|k| rows.iter().position(|a| &a.key == k));
+        let n = rows.len();
+        let selected = match pos {
+            Some(p) => p,
+            None => self.console.selected.min(n.saturating_sub(1)),
+        };
+        let pinned = rows.get(selected).map(|a| a.key.clone());
+        self.console.selected = selected;
+        self.console.pinned = pinned;
+    }
+
+    /// The cursor moved by the user: remember which agent it is on.
+    fn pin_selection(&mut self) {
+        self.console.pinned = self
+            .rows()
+            .get(self.console.selected)
+            .map(|a| a.key.clone());
     }
 
     // ------------------------------------------------------------------ input
@@ -579,9 +628,11 @@ impl App {
                 _ => {}
             }
             self.console.selected = 0;
+            self.pin_selection();
             return;
         }
         let n = self.rows().len();
+        let before = self.console.selected;
         match k.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Down | KeyCode::Char('j') => {
@@ -629,6 +680,9 @@ impl App {
             KeyCode::Char('?') => self.show_help(),
             _ => {}
         }
+        if self.console.selected != before || matches!(k.code, KeyCode::Esc) {
+            self.pin_selection();
+        }
     }
 
     fn set_filter(&mut self, f: Filter) {
@@ -638,6 +692,7 @@ impl App {
             f
         };
         self.console.selected = 0;
+        self.pin_selection();
     }
 
     fn cycle_host_filter(&mut self) {
@@ -650,6 +705,7 @@ impl App {
             }
         };
         self.console.selected = 0;
+        self.pin_selection();
     }
 
     fn show_help(&mut self) {
@@ -690,6 +746,7 @@ impl App {
             poller: None,
             chat_poller: None,
             chat_session: None,
+            blocked_since: blocked.then(Instant::now),
         };
         d.poller = Some(self.spawn_peek(key.clone()));
         if mode == DetailMode::Chat {
@@ -745,8 +802,7 @@ impl App {
 
     fn spawn_chat(&self, key: AgentKey) -> JoinHandle<()> {
         let session = self.agent(&key).and_then(|a| a.session.clone());
-        let transport: Option<Arc<dyn Transport>> =
-            self.host(&key.host).map(|h| h.handle.transport());
+        let handle = self.host(&key.host).map(|h| h.handle.clone());
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let send = |r: Result<Conversation, String>| {
@@ -756,7 +812,8 @@ impl App {
                 })
                 .is_ok()
             };
-            let Some(transport) = transport else { return };
+            let Some(handle) = handle else { return };
+            let transport: Arc<dyn Transport> = handle.transport();
             let Some(session) = session else {
                 send(Err(chat_error_text(
                     &transcript::TranscriptError::NoSession,
@@ -772,6 +829,12 @@ impl App {
             let mut follower: Option<Follower> = None;
             let mut sent_once = false;
             loop {
+                // Only while the session is connected: never dial (or
+                // re-authenticate) on our own while it is down or backing off.
+                if handle.backend().is_none() {
+                    tokio::time::sleep(CHAT_INTERVAL).await;
+                    continue;
+                }
                 if follower.is_none() {
                     match transcript::locate(transport.as_ref(), &session).await {
                         Ok(p) => follower = Some(Follower::new(harness, p)),
@@ -871,8 +934,14 @@ impl App {
             return;
         }
 
-        // View focus. While blocked, answer keys go straight to the agent.
-        if status == AgentStatus::Blocked {
+        // View focus. While blocked (and the dialog has been visible for a
+        // moment on the terminal view), answer keys go straight to the agent.
+        let d = self.detail.as_ref().expect("checked");
+        let answering = status == AgentStatus::Blocked
+            && d.mode == DetailMode::Peek
+            && d.screen.is_some()
+            && d.blocked_since.is_some_and(|t| t.elapsed() >= ANSWER_DELAY);
+        if answering {
             let answer: Option<&str> = match k.code {
                 KeyCode::Char(c @ '1'..='9') => Some(match c {
                     '1' => "1",
@@ -892,7 +961,6 @@ impl App {
                 KeyCode::Down => Some("down"),
                 KeyCode::Left => Some("left"),
                 KeyCode::Right => Some("right"),
-                KeyCode::Tab => Some("tab"),
                 _ => None,
             };
             if let Some(key_name) = answer {
@@ -949,6 +1017,21 @@ impl App {
         }
     }
 
+    fn track_blocked(&mut self) {
+        let blocked = self
+            .detail
+            .as_ref()
+            .and_then(|d| self.agent(&d.key))
+            .is_some_and(|a| a.status == AgentStatus::Blocked);
+        if let Some(d) = self.detail.as_mut() {
+            match (blocked, d.blocked_since) {
+                (true, None) => d.blocked_since = Some(Instant::now()),
+                (false, Some(_)) => d.blocked_since = None,
+                _ => {}
+            }
+        }
+    }
+
     /// Follow the new transcript when the agent started another session
     /// (Claude Code's `/clear`, Codex's new thread).
     fn restart_chat_if_session_changed(&mut self) {
@@ -996,7 +1079,7 @@ impl App {
         };
         if blank {
             if status == AgentStatus::Working {
-                self.send_keys(key, vec!["esc".into()]);
+                self.toast("中断するには Esc で操作モードにして x を押してください");
             }
             return;
         }
@@ -1006,6 +1089,7 @@ impl App {
         let key = key.clone();
         let text = text.trim_end_matches('\n').to_string();
         tokio::spawn(async move {
+            let sent = text.clone();
             let (ok, message, clear) = if status == AgentStatus::Blocked {
                 match backend.insert_text(&key.id, &text).await {
                     Ok(()) => (
@@ -1035,7 +1119,8 @@ impl App {
                 key,
                 ok,
                 message,
-                clear_draft: clear,
+                sent: clear.then_some(sent),
+                from_composer: true,
             });
         });
     }
@@ -1058,7 +1143,8 @@ impl App {
                 key,
                 ok,
                 message,
-                clear_draft: false,
+                sent: None,
+                from_composer: false,
             });
         });
     }
@@ -1131,7 +1217,9 @@ impl App {
             return;
         };
         let name = h.cfg.name.clone();
-        let mut cfg = self.cfg.clone();
+        let Some(mut cfg) = self.fresh_config() else {
+            return;
+        };
         cfg.hosts.retain(|c| c.name != name);
         if let Err(e) = cfg.save(&self.cfg_path) {
             self.toast(format!("設定を保存できませんでした: {e}"));
@@ -1149,6 +1237,20 @@ impl App {
             self.console.host_filter = None;
         }
         self.toast(format!("{name} を削除しました"));
+    }
+
+    /// The config as it is on disk now (it may have been edited since koolie
+    /// started), so a save does not undo someone else's change.
+    fn fresh_config(&mut self) -> Option<Config> {
+        match Config::load(&self.cfg_path) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                self.toast(format!(
+                    "設定ファイルを読めないため保存しませんでした: {e:#}"
+                ));
+                None
+            }
+        }
     }
 
     fn start_add(&mut self) {
@@ -1301,7 +1403,8 @@ impl App {
     }
 
     fn finish_add(&mut self) {
-        let Some(AddStep::Choose { name, options, .. }) = self.hosts_view.add.take() else {
+        // Validate first, so a mistake keeps the dialog and its choices.
+        let Some(AddStep::Choose { name, options, .. }) = self.hosts_view.add.as_ref() else {
             return;
         };
         let base = name.text().trim().to_string();
@@ -1309,12 +1412,18 @@ impl App {
             self.toast("名前を入力してください");
             return;
         }
-        let chosen: Vec<HostConfig> = options.into_iter().filter(|o| o.2).map(|o| o.1).collect();
+        let chosen: Vec<HostConfig> = options
+            .iter()
+            .filter(|o| o.2)
+            .map(|o| o.1.clone())
+            .collect();
         if chosen.is_empty() {
             self.toast("追加するサーバーを選んでください (Space)");
             return;
         }
-        let mut cfg = self.cfg.clone();
+        let Some(mut cfg) = self.fresh_config() else {
+            return;
+        };
         let mut added = Vec::new();
         for (i, mut h) in chosen.into_iter().enumerate() {
             let suffix = match (h.kind, h.session.as_deref()) {
@@ -1324,8 +1433,8 @@ impl App {
                 _ => format!("-{i}"),
             };
             h.name = self.unique_name(&format!("{base}{suffix}"));
-            if cfg.hosts.iter().any(|c| c.name == h.name) {
-                continue;
+            while cfg.hosts.iter().any(|c| c.name == h.name) {
+                h.name.push('_');
             }
             cfg.hosts.push(h.clone());
             added.push(h);
@@ -1335,6 +1444,7 @@ impl App {
             return;
         }
         self.cfg = cfg;
+        self.hosts_view.add = None;
         let names: Vec<String> = added.iter().map(|h| h.name.clone()).collect();
         for h in added {
             self.add_host_session(h);
@@ -1565,13 +1675,168 @@ echo "koolie-not-found" >&2; exit 127"#;
             out.stderr_str().trim()
         ));
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("使用量を読めませんでした: {e}"))
+    // Shell startup files may print before the JSON: use the last JSON line.
+    let text = out.stdout_str();
+    let json = text
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or("");
+    serde_json::from_str(json).map_err(|e| format!("使用量を読めませんでした: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::discover::HerdrSocket;
+
+    fn press(c: KeyCode) -> AppMsg {
+        AppMsg::Input(Event::Key(KeyEvent::new(c, KeyModifiers::NONE)))
+    }
+
+    /// An app on the demo fleet, with every host's inventory loaded.
+    async fn demo_app() -> (App, mpsc::UnboundedReceiver<AppMsg>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut cfg = Config::default();
+        cfg.notify.sinks.clear();
+        let path = std::env::temp_dir().join(format!(
+            "koolie-test-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let factory: ConnectorFactory = Arc::new(|h: &HostConfig| {
+            Arc::new(crate::demo::DemoConnector::new(&h.name)) as Arc<dyn Connector>
+        });
+        let mut app = App::new(
+            cfg,
+            path,
+            crate::demo::hosts(),
+            factory,
+            tx,
+            time::UtcOffset::UTC,
+        );
+        while app.hosts.iter().any(|h| h.inventory.is_none()) {
+            let m = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.handle(m);
+        }
+        (app, rx)
+    }
+
+    #[tokio::test]
+    async fn cursor_follows_its_agent_when_rows_resort() {
+        let (mut app, _rx) = demo_app().await;
+        app.handle(press(KeyCode::Down));
+        app.handle(press(KeyCode::Down));
+        let before = app.selected_key().unwrap();
+        // Another agent becomes blocked and sorts to the top.
+        let other = app
+            .all_agents()
+            .into_iter()
+            .find(|a| a.key != before && a.status != AgentStatus::Blocked)
+            .unwrap()
+            .key
+            .clone();
+        let mut inv = app.host(&other.host).unwrap().inventory.clone().unwrap();
+        for a in &mut inv.agents {
+            if a.key == other {
+                a.status = AgentStatus::Blocked;
+                a.state_change_seq = 999;
+            }
+        }
+        app.handle(AppMsg::Host(HostUpdate::Inventory {
+            host: other.host.clone(),
+            inventory: inv,
+        }));
+        assert_eq!(app.rows()[0].key, other, "the other agent moved to the top");
+        assert_eq!(
+            app.selected_key().unwrap(),
+            before,
+            "the cursor stayed on its agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_dialog_survives_validation_errors() {
+        let (mut app, _rx) = demo_app().await;
+        app.view = View::Hosts;
+        let opt = host_options(
+            "box",
+            &ProbeResult {
+                herdr_sockets: vec![HerdrSocket {
+                    session: "default".into(),
+                    path: "/s".into(),
+                }],
+                ..Default::default()
+            },
+        );
+        app.hosts_view.add = Some(AddStep::Choose {
+            target: "box".into(),
+            name: TextInput::default(),
+            options: opt,
+            selected: 0,
+        });
+        app.handle(press(KeyCode::Enter));
+        assert!(
+            matches!(app.hosts_view.add, Some(AddStep::Choose { .. })),
+            "an empty name keeps the dialog"
+        );
+        assert!(app.toast.as_ref().is_some_and(|(m, _)| m.contains("名前")));
+    }
+
+    #[tokio::test]
+    async fn answer_keys_wait_until_the_dialog_was_visible() {
+        let (mut app, mut rx) = demo_app().await;
+        let blocked = app
+            .all_agents()
+            .into_iter()
+            .find(|a| a.status == AgentStatus::Blocked)
+            .unwrap()
+            .key
+            .clone();
+        app.open_detail(blocked.clone(), DetailMode::Peek);
+        assert_eq!(app.detail.as_ref().unwrap().focus, Focus::View);
+        // Right away: the key is not sent to the agent.
+        app.handle(press(KeyCode::Char('1')));
+        let backend = app.host(&blocked.host).unwrap().handle.backend().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = |inv: Inventory| {
+            inv.agents
+                .into_iter()
+                .find(|a| a.key == blocked)
+                .unwrap()
+                .status
+        };
+        assert_eq!(
+            status(backend.snapshot().await.unwrap()),
+            AgentStatus::Blocked
+        );
+        // After the dialog has been on screen a moment, it is.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.detail.as_ref().unwrap().screen.is_none()
+            || app
+                .detail
+                .as_ref()
+                .unwrap()
+                .blocked_since
+                .unwrap()
+                .elapsed()
+                < ANSWER_DELAY
+        {
+            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                app.handle(m);
+            }
+            assert!(Instant::now() < deadline);
+        }
+        app.handle(press(KeyCode::Char('1')));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            status(backend.snapshot().await.unwrap()),
+            AgentStatus::Working
+        );
+    }
 
     #[test]
     fn short_host_names() {

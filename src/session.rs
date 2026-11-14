@@ -271,8 +271,59 @@ enum End {
     AppGone,
 }
 
+/// A pane vanished between a snapshot and the subscription that names it.
+fn is_pane_race(e: &BackendError) -> bool {
+    matches!(
+        e.code(),
+        Some("pane_not_found" | "agent_not_found" | "not_found")
+    )
+}
+
+/// Subscribe to `ids` and take a snapshot after it, until the snapshot's
+/// agents are exactly the subscribed ones. Returns the stream, the snapshot
+/// and the ids. Panes closing in between are retried, not failures.
+async fn sync(
+    backend: &Arc<dyn Backend>,
+    mut ids: Vec<String>,
+) -> Result<
+    (
+        mpsc::Receiver<Result<BackendEvent, BackendError>>,
+        Inventory,
+        Vec<String>,
+    ),
+    BackendError,
+> {
+    let mut last_err = None;
+    for _ in 0..6 {
+        match backend.subscribe(&ids).await {
+            Ok(rx) => {
+                let inv = backend.snapshot().await?;
+                let now = agent_ids(&inv);
+                if now == ids {
+                    return Ok((rx, inv, ids));
+                }
+                ids = now;
+            }
+            Err(e) if is_pane_race(&e) => {
+                ids = agent_ids(&backend.snapshot().await?);
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // The pane set keeps changing: settle for lifecycle events only; the
+    // next refetch notices the mismatch and tries again.
+    let rx = match backend.subscribe(&[]).await {
+        Ok(rx) => rx,
+        Err(e) => return Err(last_err.unwrap_or(e)),
+    };
+    let inv = backend.snapshot().await?;
+    Ok((rx, inv, Vec::new()))
+}
+
 fn classify(e: &BackendError) -> End {
     match e {
+        e if is_pane_race(e) => End::Retry(e.to_string()),
         BackendError::Transport(TransportError::AuthNeeded(m)) => End::Fail {
             error: format!("SSH の認証が必要です: {m}"),
             auth: true,
@@ -315,6 +366,8 @@ async fn run(
         {
             return;
         }
+        // Requests queued while we were busy are answered by this attempt.
+        while cmd.try_recv().is_ok() {}
         let end = match connector.connect().await {
             Ok(backend) => {
                 let route = connector.transport().label();
@@ -391,28 +444,10 @@ async fn connected(
         Ok(i) => i,
         Err(e) => return classify(&e),
     };
-    // Subscribe before the first snapshot so no change falls in between.
-    let mut events = match backend.subscribe(&[]).await {
-        Ok(rx) => rx,
+    let (mut events, inv, mut ids) = match sync(&backend, Vec::new()).await {
+        Ok(v) => v,
         Err(e) => return classify(&e),
     };
-    let mut inv = match backend.snapshot().await {
-        Ok(i) => i,
-        Err(e) => return classify(&e),
-    };
-    let mut ids = agent_ids(&inv);
-    if !ids.is_empty() {
-        match backend.subscribe(&ids).await {
-            Ok(rx) => events = rx,
-            Err(e) => return classify(&e),
-        }
-        // A status may have changed between the two subscriptions.
-        match backend.snapshot().await {
-            Ok(i) => inv = i,
-            Err(e) => return classify(&e),
-        }
-        ids = agent_ids(&inv);
-    }
     if let Ok(mut s) = slot.write() {
         *s = Some(backend.clone());
     }
@@ -455,9 +490,16 @@ async fn connected(
                     false
                 }
                 Some(Err(BackendError::EventsLost)) => {
-                    // Resubscribe, then refetch.
-                    match backend.subscribe(&ids).await {
-                        Ok(rx) => { events = rx; true }
+                    // Resubscribe and refetch as one step.
+                    match sync(&backend, ids.clone()).await {
+                        Ok((rx, inv, new_ids)) => {
+                            events = rx;
+                            ids = new_ids;
+                            if !send(HostUpdate::Inventory { host: host.clone(), inventory: inv }) {
+                                return End::AppGone;
+                            }
+                            false
+                        }
                         Err(e) => return classify(&e),
                     }
                 }
@@ -475,15 +517,19 @@ async fn connected(
         if !refetch {
             continue;
         }
-        let inv = match backend.snapshot().await {
+        let mut inv = match backend.snapshot().await {
             Ok(i) => i,
             Err(e) => return classify(&e),
         };
-        let new_ids = agent_ids(&inv);
-        if new_ids != ids {
-            ids = new_ids;
-            match backend.subscribe(&ids).await {
-                Ok(rx) => events = rx,
+        if agent_ids(&inv) != ids {
+            // The pane set changed: resubscribe and take the snapshot again,
+            // so no status change falls between the two.
+            match sync(&backend, agent_ids(&inv)).await {
+                Ok((rx, fresh, new_ids)) => {
+                    events = rx;
+                    ids = new_ids;
+                    inv = fresh;
+                }
                 Err(e) => return classify(&e),
             }
         }
@@ -512,6 +558,8 @@ mod tests {
         pub subscribes: AtomicUsize,
         pub snapshots: AtomicUsize,
         pub fail_snapshot: Mutex<Option<BackendError>>,
+        /// Errors returned by the next subscribe calls, in order.
+        pub fail_subscribe: Mutex<Vec<BackendError>>,
     }
 
     pub fn agent(id: &str, status: AgentStatus) -> Agent {
@@ -561,6 +609,12 @@ mod tests {
             _ids: &[String],
         ) -> crate::backend::Result<mpsc::Receiver<Result<BackendEvent, BackendError>>> {
             self.subscribes.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut f = self.fail_subscribe.lock().unwrap();
+                if !f.is_empty() {
+                    return Err(f.remove(0));
+                }
+            }
             let (tx, rx) = mpsc::channel(16);
             *self.event_tx.lock().unwrap() = Some(tx);
             Ok(rx)
@@ -693,6 +747,70 @@ mod tests {
         assert_eq!(inv.agents.len(), 2);
         assert_eq!(backend.subscribes.load(Ordering::SeqCst), before + 1);
         h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pane_closing_during_resubscribe_is_not_a_failure() {
+        let (backend, h, mut rx) = setup(vec![]);
+        next_inventory(&mut rx).await;
+        // The pane closes; the resubscribe after events_lost names it.
+        backend.inventory.lock().unwrap().agents.clear();
+        backend
+            .fail_subscribe
+            .lock()
+            .unwrap()
+            .push(BackendError::Server {
+                code: "pane_not_found".into(),
+                message: "pane p1 not found".into(),
+            });
+        let tx = backend.event_tx.lock().unwrap().clone().unwrap();
+        tx.send(Err(BackendError::EventsLost)).await.unwrap();
+        let inv = next_inventory(&mut rx).await;
+        assert!(inv.agents.is_empty());
+        // Still connected: no state change was reported.
+        assert!(h.backend().is_some());
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pane_race_on_connect_retries_instead_of_failing() {
+        let backend = Arc::new(FakeBackend::default());
+        *backend.inventory.lock().unwrap() = Inventory {
+            server_version: None,
+            agents: vec![agent("p1", AgentStatus::Idle)],
+        };
+        // The first subscribe fails once, as if a pane closed meanwhile.
+        let connector = Arc::new(FakeConnector {
+            backend: backend.clone(),
+            fails: Mutex::new(vec![]),
+        });
+        backend
+            .fail_subscribe
+            .lock()
+            .unwrap()
+            .push(BackendError::Server {
+                code: "pane_not_found".into(),
+                message: "gone".into(),
+            });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let h = spawn("h".into(), ServerKind::HerdrTui, connector, tx);
+        let inv = next_inventory(&mut rx).await;
+        assert_eq!(inv.agents.len(), 1);
+        h.shutdown().await;
+    }
+
+    #[test]
+    fn pane_races_are_retryable() {
+        let e = BackendError::Server {
+            code: "pane_not_found".into(),
+            message: String::new(),
+        };
+        assert!(matches!(classify(&e), End::Retry(_)));
+        let e = BackendError::Server {
+            code: "invalid_request".into(),
+            message: String::new(),
+        };
+        assert!(matches!(classify(&e), End::Fail { .. }));
     }
 
     #[tokio::test]

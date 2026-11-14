@@ -106,6 +106,23 @@ pub async fn run(
     }));
     let mut term = enter()?;
     let input = InputThread::spawn(tx.clone());
+    let signals = {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let (Ok(mut term), Ok(mut hup)) = (
+                signal(SignalKind::terminate()),
+                signal(SignalKind::hangup()),
+            ) else {
+                return;
+            };
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = hup.recv() => {}
+            }
+            let _ = tx.send(AppMsg::Quit);
+        })
+    };
     let ticker = {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -144,10 +161,27 @@ pub async fn run(
                     "\r\nkoolie: {} を実行します（戻るときは herdr のデタッチ操作: 通常は Ctrl+B → q）\r",
                     argv.join(" ")
                 );
-                let status = tokio::process::Command::new(&argv[0])
-                    .args(&argv[1..])
-                    .status()
-                    .await;
+                let status = match tokio::process::Command::new(&argv[0]).args(&argv[1..]).spawn() {
+                    Err(e) => Err(e),
+                    Ok(mut child) => loop {
+                        // Keep following the hosts while attached (notifications
+                        // still fire); drop what only the screen needs.
+                        tokio::select! {
+                            s = child.wait() => break s,
+                            m = rx.recv() => match m {
+                                None => break child.wait().await,
+                                Some(AppMsg::Input(_) | AppMsg::Screen { .. } | AppMsg::Tick) => {}
+                                Some(AppMsg::Quit) => {
+                                    let _ = child.kill().await;
+                                    app.quit = true;
+                                }
+                                Some(m) => app.handle(m),
+                            },
+                        }
+                    },
+                };
+                // The bell would ring inside the attached program's screen.
+                let _ = app.take_bell();
                 term = enter()?;
                 term.clear()?;
                 // Throw away keys typed while detached.
@@ -169,6 +203,7 @@ pub async fn run(
     }
     .await;
     ticker.abort();
+    signals.abort();
     input.pause();
     leave();
     app.shutdown().await;

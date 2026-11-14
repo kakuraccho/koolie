@@ -83,6 +83,14 @@ impl TextInput {
         self.chars.iter().collect()
     }
 
+    pub fn before_cursor(&self) -> String {
+        self.chars[..self.cursor].iter().collect()
+    }
+
+    pub fn after_cursor(&self) -> String {
+        self.chars[self.cursor..].iter().collect()
+    }
+
     pub fn is_blank(&self) -> bool {
         self.chars.iter().all(|c| c.is_whitespace())
     }
@@ -214,7 +222,13 @@ impl TextInput {
         let mut cursor = (0, 0);
         for (i, &c) in self.chars.iter().enumerate() {
             if i == self.cursor {
-                cursor = (lines.len() - 1, w);
+                // At the end of a full line the cursor belongs on the next
+                // row, not on the border.
+                cursor = if w >= width {
+                    (lines.len(), 0)
+                } else {
+                    (lines.len() - 1, w)
+                };
             }
             if c == '\n' {
                 lines.push(String::new());
@@ -318,5 +332,17 @@ mod tests {
         t.vertical(-1);
         t.end();
         assert_eq!(t.layout(10).1, (0, 4));
+        // Cursor at the end of an exactly full line followed by a newline.
+        t.set("abcd\nx");
+        t.vertical(-1);
+        t.end();
+        let (lines, cur) = t.layout(4);
+        assert_eq!(lines, vec!["abcd", "x"]);
+        assert_eq!(cur, (1, 0));
+        assert!(cur.1 < 4);
+        assert_eq!(
+            (t.before_cursor(), t.after_cursor()),
+            ("abcd".into(), "\nx".into())
+        );
     }
 }

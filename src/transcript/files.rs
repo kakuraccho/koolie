@@ -390,20 +390,36 @@ impl From<ScriptError> for TranscriptError {
 
 /// Run `script` with `sh` on the host, `args` as `$1`, `$2`, ... Returns its
 /// stdout when it exits 0.
+/// Printed by every script before its real output.
+const OUT_MARKER: &str = "@@KOOLIE-OUT@@";
+
+/// The bytes after the first [`OUT_MARKER`].
+fn after_marker(out: &[u8]) -> Option<&[u8]> {
+    let m = OUT_MARKER.as_bytes();
+    out.windows(m.len())
+        .position(|w| w == m)
+        .map(|i| &out[i + m.len()..])
+}
+
 async fn run_script(
     transport: &dyn Transport,
     script: &str,
     args: &[&str],
     timeout: Duration,
 ) -> Result<Vec<u8>, ScriptError> {
-    let mut argv: Vec<String> = vec!["sh".into(), "-c".into(), script.into(), "sh".into()];
+    // Startup files of the remote login shell may print before the script
+    // runs; everything up to the marker is theirs, not ours.
+    let wrapped = format!("printf '%s' '{OUT_MARKER}'\n{script}");
+    let mut argv: Vec<String> = vec!["sh".into(), "-c".into(), wrapped, "sh".into()];
     argv.extend(args.iter().map(|a| (*a).to_string()));
     let out = transport
         .exec(&argv, None, timeout)
         .await
         .map_err(|e| ScriptError::Transport(e.to_string()))?;
     match out.code {
-        Some(0) => Ok(out.stdout),
+        Some(0) => after_marker(&out.stdout)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| ScriptError::Exit(0, "output marker missing".into())),
         // Killed by a signal.
         code => Err(ScriptError::Exit(code.unwrap_or(-1), out.stderr_str())),
     }

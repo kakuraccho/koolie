@@ -380,7 +380,11 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             Paragraph::new(Line::from(vec![
                 Span::styled(" 入力待ち ", Style::new().fg(Color::White).bg(Color::Red).bold()),
                 Span::styled(
-                    "  1-9 / y / n / ↑↓ / Enter で直接答えられます（入力欄にいるときは Esc で抜けてから）",
+                    if d.mode == DetailMode::Peek {
+                        "  画面の質問に 1-9 / y / n / ↑↓ / Enter で直接答えられます（入力欄にいるときは Esc で抜けてから）"
+                    } else {
+                        "  Tab で画面に切り替えると、質問にキーで直接答えられます"
+                    },
                     Style::new().fg(Color::Red),
                 ),
             ])),
@@ -392,7 +396,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let send_label = if d.busy {
         "送信中…".to_string()
     } else if d.composer.is_blank() && status == AgentStatus::Working {
-        "Enter: 中断 (Esc)".to_string()
+        "中断は Esc → x".to_string()
     } else if status == AgentStatus::Blocked {
         "Enter: 入力欄に入れる（確定しない）".to_string()
     } else {
@@ -557,7 +561,7 @@ fn draw_snippets(f: &mut Frame, app: &App, sel: usize, area: Rect) {
         .map(|(i, s)| {
             let l = truncate(
                 &format!("{}  {}", s.name, s.text.replace('\n', " ")),
-                w as usize - 2,
+                (w as usize).saturating_sub(2),
             );
             if i == sel {
                 Line::styled(l, Style::new().reversed())
@@ -741,7 +745,11 @@ fn draw_add(f: &mut Frame, app: &App, step: &AddStep, area: Rect) {
         }
         AddStep::Manual { input } => vec![
             Line::styled(" SSH の接続先を入力してください", Style::new().fg(DIM)),
-            Line::raw(format!(" > {}▏", input.text())),
+            Line::raw(format!(
+                " > {}▏{}",
+                input.before_cursor(),
+                input.after_cursor()
+            )),
             Line::raw(""),
             Line::styled(
                 " 鍵認証でパスワードなしに入れる必要があります（koolie はパスワードを聞きません）",
@@ -760,7 +768,11 @@ fn draw_add(f: &mut Frame, app: &App, step: &AddStep, area: Rect) {
         } => {
             let mut v = vec![
                 Line::raw(format!(" {target} で見つかったサーバー")),
-                Line::raw(format!(" 名前: {}▏", name.text())),
+                Line::raw(format!(
+                    " 名前: {}▏{}",
+                    name.before_cursor(),
+                    name.after_cursor()
+                )),
                 Line::raw(""),
             ];
             for (i, (label, _, on)) in options.iter().enumerate() {
