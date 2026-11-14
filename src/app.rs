@@ -21,7 +21,7 @@ const PEEK_INTERVAL: Duration = Duration::from_millis(700);
 const CHAT_INTERVAL: Duration = Duration::from_millis(1500);
 const PEEK_LINES: u32 = 400;
 /// How long a sent prompt is shown as waiting to be recorded at most.
-const ECHO_MAX: Duration = Duration::from_secs(120);
+const ECHO_MAX: Duration = Duration::from_secs(60);
 /// How long a dialog must have been visible before answer keys reach it.
 const ANSWER_DELAY: Duration = Duration::from_millis(700);
 
@@ -164,8 +164,9 @@ pub struct DetailState {
     /// for koolie (scrolling, Enter) never lands in a dialog that just
     /// appeared.
     pub blocked_since: Option<Instant>,
-    /// A prompt sent from here that the transcript has not recorded yet.
-    pub pending_echo: Option<(String, Instant)>,
+    /// A prompt sent from here that the transcript has not recorded yet:
+    /// text, when (monotonic) and when (unix seconds).
+    pub pending_echo: Option<(String, Instant, i64)>,
 }
 
 impl Drop for DetailState {
@@ -435,12 +436,10 @@ impl App {
                 if let Some(d) = self.detail.as_mut().filter(|d| d.key == key) {
                     match result {
                         Ok(c) => {
-                            let recorded = d.pending_echo.as_ref().is_some_and(|(text, at)| {
-                                at.elapsed() > ECHO_MAX
-                                    || c.turns.iter().rev().take(3).any(|t| {
-                                        t.prompt.as_deref().map(str::trim) == Some(text.trim())
-                                    })
-                            });
+                            let recorded =
+                                d.pending_echo.as_ref().is_some_and(|(text, _, sent_at)| {
+                                    echo_recorded(&c, text, *sent_at)
+                                });
                             if recorded {
                                 d.pending_echo = None;
                             }
@@ -464,7 +463,15 @@ impl App {
                         d.busy = false;
                     }
                     if let Some(text) = echo {
-                        d.pending_echo = Some((text, Instant::now()));
+                        let sent_at = unix_now();
+                        // The transcript may already have it.
+                        let recorded = d
+                            .chat
+                            .as_ref()
+                            .is_some_and(|c| echo_recorded(c, &text, sent_at));
+                        if !recorded {
+                            d.pending_echo = Some((text, Instant::now(), sent_at));
+                        }
                     }
                     // Remove only what was sent; keep anything typed since.
                     if ok && let Some(sent) = sent {
@@ -495,6 +502,13 @@ impl App {
             AppMsg::Quit => self.quit = true,
             AppMsg::Tick => {
                 self.spinner = self.spinner.wrapping_add(1);
+                if let Some(d) = self.detail.as_mut()
+                    && d.pending_echo
+                        .as_ref()
+                        .is_some_and(|(_, at, _)| at.elapsed() > ECHO_MAX)
+                {
+                    d.pending_echo = None;
+                }
                 if self
                     .toast
                     .as_ref()
@@ -528,8 +542,14 @@ impl App {
                     .then(|| self.detail.as_ref().map(|d| d.key.clone()))
                     .flatten();
                 let notes = self.tracker.observe(&host, &inventory, viewing.as_ref());
-                // A running `koolie watch` already delivers these.
-                let watcher = !notes.is_empty() && crate::watch::read_live_status().is_some();
+                // A running `koolie watch` that is connected to this host
+                // already delivers these.
+                let watcher = !notes.is_empty()
+                    && crate::watch::read_live_status().is_some_and(|s| {
+                        s.hosts
+                            .iter()
+                            .any(|h| h.name == host && h.state == "connected")
+                    });
                 for n in &notes {
                     if !watcher {
                         notify::deliver(&self.cfg.notify, n);
@@ -555,20 +575,24 @@ impl App {
     /// Keep the cursor on the same agent when the rows change; clamp when
     /// that agent is gone.
     fn clamp_selection(&mut self) {
+        // Only an agent the user put the cursor on is followed; until then
+        // the cursor stays on its row (the most urgent one at the top).
         let rows = self.rows();
+        let n = rows.len();
         let pos = self
             .console
             .pinned
             .as_ref()
-            .and_then(|k| rows.iter().position(|a| &a.key == k));
-        let n = rows.len();
-        let selected = match pos {
-            Some(p) => p,
-            None => self.console.selected.min(n.saturating_sub(1)),
+            .map(|k| rows.iter().position(|a| &a.key == k));
+        let (selected, keep_pin) = match pos {
+            Some(Some(p)) => (p, true),
+            Some(None) => (self.console.selected.min(n.saturating_sub(1)), false),
+            None => (self.console.selected.min(n.saturating_sub(1)), true),
         };
-        let pinned = rows.get(selected).map(|a| a.key.clone());
         self.console.selected = selected;
-        self.console.pinned = pinned;
+        if !keep_pin {
+            self.console.pinned = None;
+        }
     }
 
     /// The cursor moved by the user: remember which agent it is on.
@@ -1570,6 +1594,19 @@ impl App {
     }
 }
 
+fn unix_now() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// Whether the transcript holds a prompt `text` sent at `sent_at` (unix
+/// seconds). An earlier identical prompt ("続けて") does not count.
+fn echo_recorded(c: &Conversation, text: &str, sent_at: i64) -> bool {
+    c.turns.iter().rev().take(3).any(|t| {
+        t.prompt.as_deref().map(str::trim) == Some(text.trim())
+            && t.started_at.is_none_or(|s| s >= sent_at - 5)
+    })
+}
+
 /// Whether `pane` is the herdr pane koolie itself runs in (attaching to it
 /// would nest koolie inside itself).
 pub fn is_own_pane(cfg: &HostConfig, pane: &str) -> bool {
@@ -1751,17 +1788,14 @@ mod tests {
     #[tokio::test]
     async fn cursor_follows_its_agent_when_rows_resort() {
         let (mut app, _rx) = demo_app().await;
+        // Put the cursor on row 1 ...
         app.handle(press(KeyCode::Down));
-        app.handle(press(KeyCode::Down));
+        assert_eq!(app.console.selected, 1);
         let before = app.selected_key().unwrap();
-        // Another agent becomes blocked and sorts to the top.
-        let other = app
-            .all_agents()
-            .into_iter()
-            .find(|a| a.key != before && a.status != AgentStatus::Blocked)
-            .unwrap()
-            .key
-            .clone();
+        // ... and promote an agent from below it to the top, which pushes
+        // the cursor's agent down a row.
+        let other = app.rows().last().unwrap().key.clone();
+        assert_ne!(other, before);
         let mut inv = app.host(&other.host).unwrap().inventory.clone().unwrap();
         for a in &mut inv.agents {
             if a.key == other {
@@ -1775,9 +1809,37 @@ mod tests {
         }));
         assert_eq!(app.rows()[0].key, other, "the other agent moved to the top");
         assert_eq!(
+            app.console.selected, 2,
+            "the cursor moved down with its agent"
+        );
+        assert_eq!(
             app.selected_key().unwrap(),
             before,
             "the cursor stayed on its agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn untouched_cursor_stays_on_the_top_row() {
+        let (mut app, _rx) = demo_app().await;
+        assert_eq!(app.console.selected, 0);
+        let last = app.rows().last().unwrap().key.clone();
+        let mut inv = app.host(&last.host).unwrap().inventory.clone().unwrap();
+        for a in &mut inv.agents {
+            if a.key == last {
+                a.status = AgentStatus::Blocked;
+                a.state_change_seq = 999;
+            }
+        }
+        app.handle(AppMsg::Host(HostUpdate::Inventory {
+            host: last.host.clone(),
+            inventory: inv,
+        }));
+        assert_eq!(app.console.selected, 0);
+        assert_eq!(
+            app.selected_key().unwrap(),
+            last,
+            "the most urgent agent is under the cursor"
         );
     }
 

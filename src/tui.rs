@@ -170,9 +170,17 @@ pub async fn run(
                             s = child.wait() => break s,
                             m = rx.recv() => match m {
                                 None => break child.wait().await,
-                                Some(AppMsg::Input(_) | AppMsg::Screen { .. } | AppMsg::Tick) => {}
+                                Some(AppMsg::Input(_) | AppMsg::Tick) => {}
                                 Some(AppMsg::Quit) => {
-                                    let _ = child.kill().await;
+                                    // Let the attached program restore the
+                                    // terminal before it goes.
+                                    if let Some(pid) = child.id() {
+                                        // SAFETY: plain kill(2) on our own child.
+                                        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                                    }
+                                    if tokio::time::timeout(Duration::from_secs(2), child.wait()).await.is_err() {
+                                        let _ = child.kill().await;
+                                    }
                                     app.quit = true;
                                 }
                                 Some(m) => app.handle(m),

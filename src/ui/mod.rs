@@ -535,7 +535,7 @@ fn draw_chat(f: &mut Frame, d: &DetailState, block: Block, area: Rect) {
         (Some(_), None) => vec![Line::styled("まだ会話がありません", Style::new().fg(DIM))],
         (None, None) => vec![Line::styled("読み込み中…", Style::new().fg(DIM))],
     };
-    if let Some((text, _)) = &d.pending_echo {
+    if let Some((text, _, _)) = &d.pending_echo {
         lines.push(Line::raw(""));
         for l in wrap_prefixed(text, inner.width as usize, "❯ ", "  ") {
             lines.push(Line::styled(l, Style::new().fg(Color::Cyan)));

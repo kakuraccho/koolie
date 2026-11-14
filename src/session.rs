@@ -293,7 +293,6 @@ async fn sync(
     ),
     BackendError,
 > {
-    let mut last_err = None;
     for _ in 0..6 {
         match backend.subscribe(&ids).await {
             Ok(rx) => {
@@ -304,19 +303,15 @@ async fn sync(
                 }
                 ids = now;
             }
-            Err(e) if is_pane_race(&e) => {
+            Err(ref e) if is_pane_race(e) => {
                 ids = agent_ids(&backend.snapshot().await?);
-                last_err = Some(e);
             }
             Err(e) => return Err(e),
         }
     }
     // The pane set keeps changing: settle for lifecycle events only; the
     // next refetch notices the mismatch and tries again.
-    let rx = match backend.subscribe(&[]).await {
-        Ok(rx) => rx,
-        Err(e) => return Err(last_err.unwrap_or(e)),
-    };
+    let rx = backend.subscribe(&[]).await?;
     let inv = backend.snapshot().await?;
     Ok((rx, inv, Vec::new()))
 }
@@ -674,6 +669,27 @@ mod tests {
         }
     }
 
+    /// Next inventory; panics if the session went through a reconnect on the
+    /// way (the race must be absorbed in place).
+    async fn next_inventory_no_reconnect(
+        rx: &mut mpsc::UnboundedReceiver<HostUpdate>,
+    ) -> Inventory {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                HostUpdate::Inventory { inventory, .. } => return inventory,
+                HostUpdate::State {
+                    state: s @ (ConnState::Reconnecting { .. } | ConnState::Failed { .. }),
+                    ..
+                } => panic!("unexpected {s:?}"),
+                _ => continue,
+            }
+        }
+    }
+
     async fn next_state(rx: &mut mpsc::UnboundedReceiver<HostUpdate>) -> ConnState {
         loop {
             match tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -765,9 +781,8 @@ mod tests {
             });
         let tx = backend.event_tx.lock().unwrap().clone().unwrap();
         tx.send(Err(BackendError::EventsLost)).await.unwrap();
-        let inv = next_inventory(&mut rx).await;
+        let inv = next_inventory_no_reconnect(&mut rx).await;
         assert!(inv.agents.is_empty());
-        // Still connected: no state change was reported.
         assert!(h.backend().is_some());
         h.shutdown().await;
     }
@@ -794,7 +809,7 @@ mod tests {
             });
         let (tx, mut rx) = mpsc::unbounded_channel();
         let h = spawn("h".into(), ServerKind::HerdrTui, connector, tx);
-        let inv = next_inventory(&mut rx).await;
+        let inv = next_inventory_no_reconnect(&mut rx).await;
         assert_eq!(inv.agents.len(), 1);
         h.shutdown().await;
     }
