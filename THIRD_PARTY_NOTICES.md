@@ -1,12 +1,16 @@
 # 他のプロジェクトから取り込んだもの
 
+koolie 自体は MIT License です（[LICENSE](LICENSE)）。ただし、次のものはそれぞれの出どころのライセンスに従います。
+
 ## 価格表（`src/usage/pricing.json`）
 
 - **出どころ**: Heeler に同梱されている価格表を、そのままコピーしました。
   - コピー元: <https://github.com/ZingerLittleBee/Heeler/blob/2ca0abc112a37aa4a3f241785b5e90c43411d44f/plugin/src/usage/pricing.json>
   - 価格表の版（`pricingVersion`）: 2026-10-30
   - Heeler はこの表を、LiteLLM の `model_prices_and_context_window.json` から作っています。
-- **ライセンス**: 元のデータは LiteLLM（Copyright (c) 2023 Berri AI）の MIT License です。全文は `src/usage/pricing.LICENSE` にあります。
+- **ライセンス**
+  - 元のデータは LiteLLM（Copyright (c) 2023 Berri AI）の MIT License です。全文は [`src/usage/pricing.LICENSE`](src/usage/pricing.LICENSE) にあります。
+  - ファイル自体は Heeler からのコピーなので、下の Heeler の Apache License 2.0 も当てはまります。
 - **追加した価格**: この表の版より後に出たモデルの価格を、`src/usage/prices.rs` の `SUPPLEMENT` に足しています。
 
 ## Heeler（Apache License 2.0）
@@ -27,14 +31,11 @@
 - `docs/research/claude-code-transcript-format.md`
 - `docs/research/codex-rollout-format.md`
 
-**配布する前に必要なこと**
+**ライセンス**
 
-koolie を公開・配布するなら、Apache License 2.0 の条件に従って次のことをしてください。
-
-- Apache License 2.0 の全文を同梱する。
-- Heeler に `NOTICE` ファイルがあれば、その内容も同梱する。
-
-どちらも、まだ同梱していません。
+- 全文: [`licenses/Heeler-Apache-2.0.txt`](licenses/Heeler-Apache-2.0.txt)。コミット `2ca0abc` の `LICENSE` をそのままコピーしました。
+- Heeler には `NOTICE` ファイルがありません（同じコミットで確認）。
+- 移植したファイルには、移植元と、Rust に書き直して変更したことを先頭のコメントに書いています。
 
 ## herdr の API スキーマ（`docs/reference/herdr-api-schema-0.9.5.json`）
 

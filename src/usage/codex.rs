@@ -1,7 +1,8 @@
 //! Codex rollouts: `~/.codex/sessions/**/rollout-*.jsonl`.
 //!
-//! A port of Heeler's `plugin/src/usage/codex-scanner.js` (Apache-2.0) and
-//! the rules in its `docs/design/agent-usage.md`:
+//! A port of Heeler's `plugin/src/usage/codex-scanner.js` (Apache-2.0, see
+//! `THIRD_PARTY_NOTICES.md`) and the rules in its `docs/design/agent-usage.md`,
+//! rewritten in Rust and changed for koolie:
 //! - `token_usage_record` (Codex 0.153+): one per response, counted once per
 //!   `response_id` globally; a record of another thread (copied fork) is not
 //!   counted from this file.

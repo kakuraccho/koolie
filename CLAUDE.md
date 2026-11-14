@@ -8,7 +8,8 @@ koolie is a Rust + ratatui terminal console for coding agents running in herdr
 - `docs/development.md` — tests, manual testing in tmux, real-herdr checks, review rules.
 - `docs/status.md` — what is verified on real machines, known limits, next steps. Keep it current.
 - `docs/notes/` — dated development notes (history; do not rewrite old ones).
-- `THIRD_PARTY_NOTICES.md` — anything copied or ported from other projects goes here.
+- `LICENSE` (MIT); `THIRD_PARTY_NOTICES.md` + `licenses/` — anything copied or ported from other
+  projects is listed there, and a ported file says so in its header comment.
 
 ## Build & test
 

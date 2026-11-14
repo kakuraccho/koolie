@@ -198,3 +198,12 @@ herdr integration install codex
 | [docs/notes/](docs/notes/) | 開発の記録 |
 | [docs/reference/](docs/reference/) | herdr の API スキーマ |
 | [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) | 取り込んだデータとコードの出どころとライセンス |
+
+## ライセンス
+
+MIT License です（[LICENSE](LICENSE)）。
+
+ただし、次のものは出どころのライセンスに従います。詳しくは [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を見てください。
+
+- Heeler から移植したコード（Apache License 2.0）
+- 価格表のデータ（LiteLLM、MIT License）
