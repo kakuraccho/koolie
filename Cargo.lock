@@ -752,6 +752,7 @@ dependencies = [
  "clap",
  "crossterm",
  "libc",
+ "memchr",
  "notify-rust",
  "ratatui",
  "serde",

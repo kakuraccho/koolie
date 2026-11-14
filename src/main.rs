@@ -124,7 +124,7 @@ async fn run(cli: Cli, utc_offset: time::UtcOffset) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
-                print!("{}", usage_text(&report));
+                print!("{}", usage::render_text(&report));
             }
             Ok(())
         }
@@ -154,7 +154,7 @@ async fn run(cli: Cli, utc_offset: time::UtcOffset) -> Result<()> {
                 "herdr-core:    {}",
                 p.core_bin.as_deref().unwrap_or("(not found)")
             );
-            if let Some(s) = &p.core_socket {
+            if let (Some(_), Some(s)) = (&p.core_bin, &p.core_socket) {
                 println!("  socket       {s}");
             }
             println!(
@@ -165,38 +165,6 @@ async fn run(cli: Cli, utc_offset: time::UtcOffset) -> Result<()> {
         }
         Some(Cmd::Hosts { cmd }) => hosts_cmd(cmd, cfg, &cfg_path).await,
     }
-}
-
-fn usage_text(r: &usage::UsageReport) -> String {
-    let mut by: std::collections::BTreeMap<(String, String), (u64, f64, bool)> = Default::default();
-    for row in &r.rows {
-        let e = by
-            .entry((row.program.clone(), row.model.clone()))
-            .or_default();
-        e.0 +=
-            row.input_tokens + row.output_tokens + row.cache_read_tokens + row.cache_write_tokens;
-        match row.cost_usd {
-            Some(c) => e.1 += c,
-            None => e.2 = true,
-        }
-    }
-    let mut s = format!(
-        "Token usage, last {} days (estimate at API list prices, not a bill)\n",
-        r.days
-    );
-    let mut total = 0.0;
-    for ((p, m), (t, c, unpriced)) in &by {
-        total += c;
-        s.push_str(&format!(
-            "  {p:<8} {m:<36} {t:>14} tokens  ${c:>9.2}{}\n",
-            if *unpriced { " (+unpriced)" } else { "" }
-        ));
-    }
-    s.push_str(&format!(
-        "  {:<45} {:>14}         ${total:>9.2}\n",
-        "total", ""
-    ));
-    s
 }
 
 async fn hosts_cmd(cmd: HostsCmd, mut cfg: Config, cfg_path: &std::path::Path) -> Result<()> {
