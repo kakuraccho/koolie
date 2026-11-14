@@ -523,7 +523,7 @@ pub fn chat_lines(c: &Conversation, width: usize) -> Vec<Line<'static>> {
 
 fn draw_chat(f: &mut Frame, d: &DetailState, block: Block, area: Rect) {
     let inner = block.inner(area);
-    let lines: Vec<Line> = match (&d.chat, &d.chat_error) {
+    let mut lines: Vec<Line> = match (&d.chat, &d.chat_error) {
         (Some(c), _) if !c.turns.is_empty() => chat_lines(c, inner.width as usize),
         (_, Some(e)) => wrap(
             &format!("チャットを表示できません: {e}"),
@@ -535,6 +535,13 @@ fn draw_chat(f: &mut Frame, d: &DetailState, block: Block, area: Rect) {
         (Some(_), None) => vec![Line::styled("まだ会話がありません", Style::new().fg(DIM))],
         (None, None) => vec![Line::styled("読み込み中…", Style::new().fg(DIM))],
     };
+    if let Some((text, _)) = &d.pending_echo {
+        lines.push(Line::raw(""));
+        for l in wrap_prefixed(text, inner.width as usize, "❯ ", "  ") {
+            lines.push(Line::styled(l, Style::new().fg(Color::Cyan)));
+        }
+        lines.push(Line::styled("  送信済み・記録待ち", Style::new().fg(DIM)));
+    }
     let h = inner.height as usize;
     let total = lines.len();
     let scroll = d.chat_scroll.min(total.saturating_sub(h));

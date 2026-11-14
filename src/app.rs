@@ -20,6 +20,8 @@ use tokio::task::JoinHandle;
 const PEEK_INTERVAL: Duration = Duration::from_millis(700);
 const CHAT_INTERVAL: Duration = Duration::from_millis(1500);
 const PEEK_LINES: u32 = 400;
+/// How long a sent prompt is shown as waiting to be recorded at most.
+const ECHO_MAX: Duration = Duration::from_secs(120);
 /// How long a dialog must have been visible before answer keys reach it.
 const ANSWER_DELAY: Duration = Duration::from_millis(700);
 
@@ -45,6 +47,9 @@ pub enum AppMsg {
         sent: Option<String>,
         /// The composer's own send finished (clears `busy`).
         from_composer: bool,
+        /// A prompt that was submitted: Chat shows it until the transcript
+        /// records it.
+        echo: Option<String>,
     },
     Usage {
         host: HostId,
@@ -159,6 +164,8 @@ pub struct DetailState {
     /// for koolie (scrolling, Enter) never lands in a dialog that just
     /// appeared.
     pub blocked_since: Option<Instant>,
+    /// A prompt sent from here that the transcript has not recorded yet.
+    pub pending_echo: Option<(String, Instant)>,
 }
 
 impl Drop for DetailState {
@@ -428,6 +435,15 @@ impl App {
                 if let Some(d) = self.detail.as_mut().filter(|d| d.key == key) {
                     match result {
                         Ok(c) => {
+                            let recorded = d.pending_echo.as_ref().is_some_and(|(text, at)| {
+                                at.elapsed() > ECHO_MAX
+                                    || c.turns.iter().rev().take(3).any(|t| {
+                                        t.prompt.as_deref().map(str::trim) == Some(text.trim())
+                                    })
+                            });
+                            if recorded {
+                                d.pending_echo = None;
+                            }
                             d.chat = Some(c);
                             d.chat_error = None;
                         }
@@ -441,10 +457,14 @@ impl App {
                 message,
                 sent,
                 from_composer,
+                echo,
             } => {
                 if let Some(d) = self.detail.as_mut().filter(|d| d.key == key) {
                     if from_composer {
                         d.busy = false;
+                    }
+                    if let Some(text) = echo {
+                        d.pending_echo = Some((text, Instant::now()));
                     }
                     // Remove only what was sent; keep anything typed since.
                     if ok && let Some(sent) = sent {
@@ -747,6 +767,7 @@ impl App {
             chat_poller: None,
             chat_session: None,
             blocked_since: blocked.then(Instant::now),
+            pending_echo: None,
         };
         d.poller = Some(self.spawn_peek(key.clone()));
         if mode == DetailMode::Chat {
@@ -1119,8 +1140,9 @@ impl App {
                 key,
                 ok,
                 message,
-                sent: clear.then_some(sent),
+                sent: clear.then_some(sent.clone()),
                 from_composer: true,
+                echo: (ok && status != AgentStatus::Blocked).then_some(sent),
             });
         });
     }
@@ -1145,6 +1167,7 @@ impl App {
                 message,
                 sent: None,
                 from_composer: false,
+                echo: None,
             });
         });
     }
@@ -1756,6 +1779,56 @@ mod tests {
             before,
             "the cursor stayed on its agent"
         );
+    }
+
+    #[tokio::test]
+    async fn sent_prompt_is_echoed_until_recorded() {
+        let (mut app, _rx) = demo_app().await;
+        let key = app.all_agents()[0].key.clone();
+        app.open_detail(key.clone(), DetailMode::Chat);
+        app.detail.as_mut().unwrap().composer.set("テスト");
+        app.handle(AppMsg::Action {
+            key: key.clone(),
+            ok: true,
+            message: "送信しました".into(),
+            sent: Some("テスト".into()),
+            from_composer: true,
+            echo: Some("テスト".into()),
+        });
+        let d = app.detail.as_ref().unwrap();
+        assert!(d.composer.text().is_empty());
+        assert!(d.pending_echo.is_some());
+        // A transcript without it keeps the echo; one with it clears it.
+        let mut c = Conversation::default();
+        app.handle(AppMsg::Chat {
+            key: key.clone(),
+            result: Ok(c.clone()),
+        });
+        assert!(app.detail.as_ref().unwrap().pending_echo.is_some());
+        c.turns.push(crate::transcript::Turn {
+            prompt: Some("テスト".into()),
+            in_progress: true,
+            ..Default::default()
+        });
+        app.handle(AppMsg::Chat { key, result: Ok(c) });
+        assert!(app.detail.as_ref().unwrap().pending_echo.is_none());
+    }
+
+    #[tokio::test]
+    async fn text_typed_while_sending_is_kept() {
+        let (mut app, _rx) = demo_app().await;
+        let key = app.all_agents()[0].key.clone();
+        app.open_detail(key.clone(), DetailMode::Peek);
+        app.detail.as_mut().unwrap().composer.set("first\nsecond");
+        app.handle(AppMsg::Action {
+            key,
+            ok: true,
+            message: "送信しました".into(),
+            sent: Some("first".into()),
+            from_composer: true,
+            echo: None,
+        });
+        assert_eq!(app.detail.as_ref().unwrap().composer.text(), "second");
     }
 
     #[tokio::test]
