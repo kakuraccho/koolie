@@ -14,7 +14,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 const PEEK_INTERVAL: Duration = Duration::from_millis(700);
@@ -24,6 +24,8 @@ const PEEK_LINES: u32 = 400;
 const ECHO_MAX: Duration = Duration::from_secs(60);
 /// How long a dialog must have been visible before answer keys reach it.
 const ANSWER_DELAY: Duration = Duration::from_millis(700);
+/// How long after a direct-mode key the screen is read again.
+const DIRECT_REDRAW: Duration = Duration::from_millis(60);
 
 /// Messages into the app loop.
 #[derive(Debug)]
@@ -137,6 +139,16 @@ pub enum DetailMode {
 pub enum Focus {
     View,
     Compose,
+    /// Direct mode: every key goes to the agent as typed (menus such as
+    /// Claude Code's `/model` that herdr does not report as blocked).
+    Direct,
+}
+
+/// Input queued for the agent in direct mode, sent in order.
+#[derive(Debug)]
+enum DirectInput {
+    Key(String),
+    Text(String),
 }
 
 #[derive(Debug)]
@@ -157,6 +169,10 @@ pub struct DetailState {
     pub snippet_picker: Option<usize>,
     poller: Option<JoinHandle<()>>,
     chat_poller: Option<JoinHandle<()>>,
+    /// Wakes the screen poller early (after a direct-mode key).
+    peek_wake: Arc<Notify>,
+    /// Direct mode's queue and the task that drains it.
+    direct: Option<(mpsc::UnboundedSender<DirectInput>, JoinHandle<()>)>,
     /// The agent session the chat poller follows.
     chat_session: Option<crate::model::AgentSession>,
     /// Since when the agent has been seen blocked. Answer keys only go to
@@ -175,6 +191,9 @@ impl Drop for DetailState {
             p.abort();
         }
         if let Some(p) = self.chat_poller.take() {
+            p.abort();
+        }
+        if let Some((_, p)) = self.direct.take() {
             p.abort();
         }
     }
@@ -616,7 +635,13 @@ impl App {
     fn on_paste(&mut self, s: &str) {
         match self.view {
             View::Detail => {
-                if let Some(d) = self.detail.as_mut() {
+                if self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|d| d.focus == Focus::Direct)
+                {
+                    self.send_direct(DirectInput::Text(s.to_string()));
+                } else if let Some(d) = self.detail.as_mut() {
                     d.focus = Focus::Compose;
                     d.composer.insert_str(s);
                 }
@@ -633,13 +658,17 @@ impl App {
 
     fn on_key(&mut self, k: KeyEvent) {
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
-            // Ctrl+C quits from anywhere except the composer, where it clears.
-            if let (View::Detail, Some(d)) = (self.view, self.detail.as_mut())
-                && d.focus == Focus::Compose
-                && !d.composer.is_blank()
-            {
-                d.composer.clear();
-                return;
+            // Ctrl+C quits from anywhere except the composer, where it clears,
+            // and direct mode, which it leaves (never sent to the agent).
+            if let (View::Detail, Some(d)) = (self.view, self.detail.as_mut()) {
+                if d.focus == Focus::Direct {
+                    d.focus = Focus::View;
+                    return;
+                }
+                if d.focus == Focus::Compose && !d.composer.is_blank() {
+                    d.composer.clear();
+                    return;
+                }
             }
             self.quit = true;
             return;
@@ -789,11 +818,13 @@ impl App {
             snippet_picker: None,
             poller: None,
             chat_poller: None,
+            peek_wake: Arc::new(Notify::new()),
+            direct: None,
             chat_session: None,
             blocked_since: blocked.then(Instant::now),
             pending_echo: None,
         };
-        d.poller = Some(self.spawn_peek(key.clone()));
+        d.poller = Some(self.spawn_peek(key.clone(), d.peek_wake.clone()));
         if mode == DetailMode::Chat {
             d.chat_session = self.agent(&key).and_then(|a| a.session.clone());
             d.chat_poller = Some(self.spawn_chat(key));
@@ -807,7 +838,7 @@ impl App {
         self.view = View::Console;
     }
 
-    fn spawn_peek(&self, key: AgentKey) -> JoinHandle<()> {
+    fn spawn_peek(&self, key: AgentKey, wake: Arc<Notify>) -> JoinHandle<()> {
         let handle = self.host(&key.host).map(|h| h.handle.clone());
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -840,9 +871,108 @@ impl App {
                         return;
                     }
                 }
-                tokio::time::sleep(PEEK_INTERVAL).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(PEEK_INTERVAL) => {}
+                    _ = wake.notified() => {}
+                }
             }
         })
+    }
+
+    /// The task that sends direct-mode input in order. Keys that queued up
+    /// while a request was out go together in the next one.
+    fn spawn_direct(
+        &self,
+        key: AgentKey,
+        wake: Arc<Notify>,
+    ) -> (mpsc::UnboundedSender<DirectInput>, JoinHandle<()>) {
+        let handle = self.host(&key.host).map(|h| h.handle.clone());
+        let tx = self.tx.clone();
+        let (in_tx, mut rx) = mpsc::unbounded_channel::<DirectInput>();
+        let task = tokio::spawn(async move {
+            let mut next = None;
+            loop {
+                let first = match next.take() {
+                    Some(i) => i,
+                    None => match rx.recv().await {
+                        Some(i) => i,
+                        None => return,
+                    },
+                };
+                let mut keys = Vec::new();
+                let text = match first {
+                    DirectInput::Key(k) => {
+                        keys.push(k);
+                        while let Ok(i) = rx.try_recv() {
+                            match i {
+                                DirectInput::Key(k) => keys.push(k),
+                                other => {
+                                    next = Some(other);
+                                    break;
+                                }
+                            }
+                        }
+                        None
+                    }
+                    DirectInput::Text(t) => Some(t),
+                };
+                let backend = handle.as_ref().and_then(|h| h.backend());
+                let r = match (backend, text) {
+                    (None, _) => Err("ホストに接続されていません".to_string()),
+                    (Some(b), Some(t)) => {
+                        b.insert_text(&key.id, &t).await.map_err(|e| e.to_string())
+                    }
+                    (Some(b), None) => b.send_keys(&key.id, &keys).await.map_err(|e| e.to_string()),
+                };
+                if let Err(e) = r {
+                    let _ = tx.send(AppMsg::Action {
+                        key: key.clone(),
+                        ok: false,
+                        message: format!("キーを送れませんでした: {e}"),
+                        sent: None,
+                        from_composer: false,
+                        echo: None,
+                    });
+                }
+                // Give the program a moment to redraw, then read the screen.
+                tokio::time::sleep(DIRECT_REDRAW).await;
+                wake.notify_one();
+            }
+        });
+        (in_tx, task)
+    }
+
+    fn enter_direct(&mut self) {
+        let Some(d) = self.detail.as_ref() else {
+            return;
+        };
+        let worker = d
+            .direct
+            .is_none()
+            .then(|| self.spawn_direct(d.key.clone(), d.peek_wake.clone()));
+        let d = self.detail.as_mut().expect("checked");
+        if worker.is_some() {
+            d.direct = worker;
+        }
+        // Direct mode works on what the terminal shows now.
+        d.mode = DetailMode::Peek;
+        d.scroll = 0;
+        d.snippet_picker = None;
+        d.focus = Focus::Direct;
+    }
+
+    fn send_direct(&mut self, input: DirectInput) {
+        let key = match self.detail.as_ref() {
+            Some(d) => d.key.clone(),
+            None => return,
+        };
+        if !self.is_live(&key) {
+            self.toast("ホストに接続されていません");
+            return;
+        }
+        if let Some((tx, _)) = self.detail.as_ref().and_then(|d| d.direct.as_ref()) {
+            let _ = tx.send(input);
+        }
     }
 
     fn spawn_chat(&self, key: AgentKey) -> JoinHandle<()> {
@@ -942,6 +1072,15 @@ impl App {
             return;
         }
 
+        if d.focus == Focus::Direct {
+            if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('g') {
+                d.focus = Focus::View;
+            } else if let Some(name) = direct_key(&k) {
+                self.send_direct(DirectInput::Key(name));
+            }
+            return;
+        }
+
         if d.focus == Focus::Compose {
             let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
             let alt = k.modifiers.contains(KeyModifiers::ALT)
@@ -1020,6 +1159,7 @@ impl App {
             KeyCode::Tab | KeyCode::Char('c') => self.toggle_mode(),
             KeyCode::Char('a') => self.request_attach(&key),
             KeyCode::Char('x') => self.send_keys(&key, vec!["esc".into()]),
+            KeyCode::Char('p') => self.enter_direct(),
             KeyCode::Char('s') => {
                 if !self.cfg.snippets.is_empty() {
                     d.snippet_picker = Some(0);
@@ -1638,6 +1778,56 @@ pub fn chat_error_text(e: &transcript::TranscriptError) -> String {
     }
 }
 
+/// The key name (herdr's vocabulary) that `k` presses in direct mode, or
+/// `None` for a key that has no name.
+pub fn direct_key(k: &KeyEvent) -> Option<String> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
+    let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+    let mut name = String::new();
+    if ctrl {
+        name.push_str("ctrl+");
+    }
+    if alt {
+        name.push_str("alt+");
+    }
+    let base = match k.code {
+        // Shift is already in the character ('J', '!'), except under Ctrl,
+        // where the terminal cannot tell `ctrl+a` from `ctrl+A` anyway.
+        KeyCode::Char(' ') => "space".to_string(),
+        KeyCode::Char(c) if ctrl => c.to_lowercase().to_string(),
+        KeyCode::Char(c) => {
+            name.push(c);
+            return Some(name);
+        }
+        KeyCode::Enter => "enter".into(),
+        KeyCode::Tab => "tab".into(),
+        KeyCode::BackTab => {
+            name.push_str("shift+tab");
+            return Some(name);
+        }
+        KeyCode::Backspace => "backspace".into(),
+        KeyCode::Esc => "esc".into(),
+        KeyCode::Up => "up".into(),
+        KeyCode::Down => "down".into(),
+        KeyCode::Left => "left".into(),
+        KeyCode::Right => "right".into(),
+        KeyCode::Home => "home".into(),
+        KeyCode::End => "end".into(),
+        KeyCode::PageUp => "pageup".into(),
+        KeyCode::PageDown => "pagedown".into(),
+        KeyCode::Delete => "delete".into(),
+        KeyCode::Insert => "insert".into(),
+        KeyCode::F(n) => format!("f{n}"),
+        _ => return None,
+    };
+    if shift {
+        name.push_str("shift+");
+    }
+    name.push_str(&base);
+    Some(name)
+}
+
 fn scroll(d: &mut DetailState, delta: i64) {
     let target = match d.mode {
         DetailMode::Peek => &mut d.scroll,
@@ -1919,6 +2109,96 @@ mod tests {
             "an empty name keeps the dialog"
         );
         assert!(app.toast.as_ref().is_some_and(|(m, _)| m.contains("名前")));
+    }
+
+    fn chord(c: KeyCode, m: KeyModifiers) -> AppMsg {
+        AppMsg::Input(Event::Key(KeyEvent::new(c, m)))
+    }
+
+    #[test]
+    fn direct_key_names() {
+        let k = |c, m| direct_key(&KeyEvent::new(c, m)).unwrap();
+        let none = KeyModifiers::NONE;
+        assert_eq!(k(KeyCode::Char('j'), none), "j");
+        assert_eq!(k(KeyCode::Char('J'), KeyModifiers::SHIFT), "J");
+        assert_eq!(k(KeyCode::Char('あ'), none), "あ");
+        assert_eq!(k(KeyCode::Char(' '), none), "space");
+        assert_eq!(k(KeyCode::Char('c'), KeyModifiers::CONTROL), "ctrl+c");
+        assert_eq!(
+            k(
+                KeyCode::Char('A'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ),
+            "ctrl+shift+a"
+        );
+        assert_eq!(k(KeyCode::Char('x'), KeyModifiers::ALT), "alt+x");
+        assert_eq!(k(KeyCode::Enter, none), "enter");
+        assert_eq!(k(KeyCode::Enter, KeyModifiers::ALT), "alt+enter");
+        assert_eq!(k(KeyCode::Esc, none), "esc");
+        assert_eq!(k(KeyCode::BackTab, KeyModifiers::SHIFT), "shift+tab");
+        assert_eq!(k(KeyCode::Up, KeyModifiers::SHIFT), "shift+up");
+        assert_eq!(k(KeyCode::PageDown, none), "pagedown");
+        assert_eq!(k(KeyCode::F(5), none), "f5");
+        assert!(direct_key(&KeyEvent::new(KeyCode::CapsLock, none)).is_none());
+    }
+
+    /// The reported bug: a menu (Claude Code's `/model`) on an agent that
+    /// herdr reports as done, not blocked. Its keys must be able to reach
+    /// the agent instead of the composer.
+    #[tokio::test]
+    async fn direct_mode_sends_keys_to_an_agent_that_is_not_blocked() {
+        let (mut app, mut rx) = demo_app().await;
+        let done = app
+            .all_agents()
+            .into_iter()
+            .find(|a| a.status == AgentStatus::Done)
+            .unwrap()
+            .key
+            .clone();
+        app.open_detail(done.clone(), DetailMode::Chat);
+        assert_eq!(app.detail.as_ref().unwrap().focus, Focus::Compose);
+        app.handle(press(KeyCode::Esc));
+        app.handle(press(KeyCode::Char('p')));
+        let d = app.detail.as_ref().unwrap();
+        assert_eq!(d.focus, Focus::Direct);
+        assert_eq!(d.mode, DetailMode::Peek);
+        for c in ['j', 'k'] {
+            app.handle(press(KeyCode::Char(c)));
+        }
+        // Esc goes to the agent too; it does not leave direct mode.
+        app.handle(press(KeyCode::Esc));
+        assert_eq!(app.detail.as_ref().unwrap().focus, Focus::Direct);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let sent = |app: &App| {
+            let text = app
+                .detail
+                .as_ref()
+                .and_then(|d| d.screen.as_ref())
+                .map(|s| s.text.clone())
+                .unwrap_or_default();
+            text.matches("(キー)").count() > 0
+                && ["j", "k", "esc"].iter().all(|k| {
+                    text.lines().filter(|l| l.contains("(キー)")).any(|l| {
+                        l.split_whitespace()
+                            .any(|w| w.trim_end_matches("\x1b[0m") == *k)
+                    })
+                })
+        };
+        while !sent(&app) {
+            if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                app.handle(m);
+            }
+            assert!(Instant::now() < deadline, "keys never reached the agent");
+        }
+        assert!(app.detail.as_ref().unwrap().composer.is_blank());
+        // Ctrl+C leaves direct mode instead of quitting or reaching the agent.
+        app.handle(chord(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.quit);
+        assert_eq!(app.detail.as_ref().unwrap().focus, Focus::View);
+        // Ctrl+G leaves it too.
+        app.handle(press(KeyCode::Char('p')));
+        app.handle(chord(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert_eq!(app.detail.as_ref().unwrap().focus, Focus::View);
     }
 
     #[tokio::test]

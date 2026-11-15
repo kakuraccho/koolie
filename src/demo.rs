@@ -217,12 +217,18 @@ impl Backend for DemoBackend {
         }
         Ok(())
     }
-    async fn send_keys(&self, id: &str, _keys: &[String]) -> Result<()> {
+    async fn send_keys(&self, id: &str, keys: &[String]) -> Result<()> {
+        let mut answered = false;
         if let Ok(mut v) = self.agents.lock()
             && let Some(a) = v.iter_mut().find(|a| a.key.id == id)
             && a.status == AgentStatus::Blocked
         {
             a.status = AgentStatus::Working;
+            answered = true;
+        }
+        // Show other keys on the screen, so direct mode has something to do.
+        if !answered && let Ok(mut l) = self.log.lock() {
+            l.push(format!("(キー) {}", keys.join(" ")));
         }
         Ok(())
     }
