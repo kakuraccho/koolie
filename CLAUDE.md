@@ -27,7 +27,9 @@ koolie is a Rust + ratatui terminal console for coding agents running in herdr
 - `src/discover/` — host candidates (ssh config / tailscale / herdr machines) and the read-only `probe.sh`.
 - `src/transcript/` — Chat: Claude Code / Codex transcripts into turns; local or remote reads.
 - `src/usage/` — token usage and cost; `pricing.json` (+ `SUPPLEMENT` in `prices.rs`).
-- `src/app.rs` (state, keys), `src/ui/` (drawing, `text.rs` editor), `src/tui.rs` (terminal loop, attach).
+- `src/app.rs` (state, keys), `src/tui.rs` (terminal loop, attach).
+- `src/ui/` — drawing, one file per view; `theme.rs` (all colors — use its roles, never raw colors),
+  `widgets.rs` (pills, help line), `markdown.rs` (Chat answers), `text.rs` (wrapping, editor).
 - `src/notify.rs`, `src/watch.rs` (`watch` / `status`), `src/config.rs`, `src/demo.rs`, `src/main.rs` (CLI).
 - `tests/fake_herdr.rs` — integration tests against a fake herdr socket server.
 - `docs/reference/herdr-api-schema-0.9.5.json` — herdr's socket API schema.

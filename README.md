@@ -174,6 +174,9 @@ command = "curl -d \"$KOOLIE_AGENT: $KOOLIE_STATUS\" ntfy.sh/my-topic"
 [[snippet]]
 name = "続けて"
 text = "続けてください"
+
+[ui]
+theme = "auto"                # 端末の背景に合わせた色: "auto" / "dark" / "light"
 ```
 
 `command` には環境変数 `KOOLIE_HOST`、`KOOLIE_AGENT`、`KOOLIE_STATUS`、`KOOLIE_TITLE`、`KOOLIE_ID` が渡されます。
@@ -185,6 +188,13 @@ text = "続けてください"
 | `KOOLIE_CONFIG` | 設定ファイルの場所 |
 | `KOOLIE_SSH` | 使う `ssh` コマンド（既定は PATH 上の `ssh`） |
 | `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` / `XDG_RUNTIME_DIR` | 設定・キャッシュ・ソケットと status.json の置き場所 |
+| `NO_COLOR` | 色を使わない（空でない値のとき） |
+| `COLORTERM` / `TERM` | 使える色の数の判定。`COLORTERM=truecolor` なら 24 bit 色、`TERM` に `256color` があれば 256 色、それ以外は 16 色 |
+| `COLORFGBG` | `theme = "auto"` のときの背景の明暗の判定（ない端末では暗い背景として扱う） |
+
+### 見た目
+
+画面の見た目は、Charm の [Bubble Tea](https://github.com/charmbracelet/bubbletea) で作られたアプリ（[charm.land](https://charm.land/)）に合わせています。色の数が少ない端末では、近い色に置き換えて表示します。明るい背景の端末で色が見にくいときは、`[ui]` の `theme = "light"` を指定してください。
 
 ## チャット表示の前提
 

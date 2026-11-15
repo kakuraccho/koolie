@@ -345,8 +345,9 @@ impl App {
         self.hosts.iter_mut().find(|h| h.cfg.name == id)
     }
 
+    /// The working spinner (bubbles spinner's `Dot`).
     pub fn spinner(&self) -> char {
-        const S: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
+        const S: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
         S[self.spinner % S.len()]
     }
 
