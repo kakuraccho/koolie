@@ -104,6 +104,7 @@ pub async fn run(
         leave();
         hook(info);
     }));
+    crate::ui::theme::init(app.cfg.ui.theme.dark());
     let mut term = enter()?;
     let input = InputThread::spawn(tx.clone());
     let signals = {

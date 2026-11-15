@@ -15,6 +15,42 @@ pub struct Config {
     pub notify: NotifyConfig,
     #[serde(rename = "snippet", skip_serializing_if = "Vec::is_empty")]
     pub snippets: Vec<Snippet>,
+    #[serde(skip_serializing_if = "UiConfig::is_default")]
+    pub ui: UiConfig,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub theme: ThemeChoice,
+}
+
+impl UiConfig {
+    fn is_default(&self) -> bool {
+        *self == UiConfig::default()
+    }
+}
+
+/// Colors for a dark or a light terminal background.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    /// From `COLORFGBG` when the terminal sets it; dark otherwise.
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+impl ThemeChoice {
+    /// `Some(true)` for dark, `None` to detect.
+    pub fn dark(self) -> Option<bool> {
+        match self {
+            ThemeChoice::Auto => None,
+            ThemeChoice::Dark => Some(true),
+            ThemeChoice::Light => Some(false),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -259,6 +295,9 @@ command = "echo hi"
 [[snippet]]
 name = "続けて"
 text = "続けてください"
+
+[ui]
+theme = "light"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(cfg.local.auto);
@@ -268,6 +307,7 @@ text = "続けてください"
         assert!(!cfg.hosts[1].enabled);
         assert_eq!(cfg.notify.on, vec![AgentStatus::Blocked]);
         assert_eq!(cfg.snippets[0].name, "続けて");
+        assert_eq!(cfg.ui.theme, ThemeChoice::Light);
     }
 
     #[test]
@@ -288,6 +328,8 @@ text = "続けてください"
         });
         cfg.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), cfg);
+        // The default [ui] is not written out.
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("[ui]"));
     }
 
     #[test]

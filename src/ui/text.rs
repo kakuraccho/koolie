@@ -36,25 +36,56 @@ pub fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// Hard-wrap text to `width` columns (breaking anywhere; CJK text has no
-/// spaces). Newlines start new lines. Always returns at least one line.
+/// Wrap text to `width` columns. Newlines start new lines. Lines break at
+/// a space when there is one, so English words stay whole, and after any
+/// wide (CJK) character, since CJK text has no spaces; a word longer than
+/// the line is broken anywhere. Always returns at least one line.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out = Vec::new();
     for line in text.split('\n') {
-        let mut cur = String::new();
+        let mut cur: Vec<char> = Vec::new();
         let mut w = 0;
+        // Where `cur` may be split: just after a space or a wide char.
+        let mut brk: Option<usize> = None;
         for c in line.chars() {
             let c = if c == '\t' { ' ' } else { c };
             let cw = char_width(c);
             if w + cw > width && !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-                w = 0;
+                if c == ' ' {
+                    // The space ends this line and is dropped.
+                    out.push(cur.drain(..).collect::<String>().trim_end().to_string());
+                    w = 0;
+                    brk = None;
+                    continue;
+                }
+                let head_ok = brk
+                    .is_some_and(|b| b <= cur.len() && cur[..b].iter().any(|c| !c.is_whitespace()));
+                match brk {
+                    Some(b) if head_ok => {
+                        let rest = cur.split_off(b);
+                        out.push(cur.iter().collect::<String>().trim_end().to_string());
+                        cur = rest;
+                        w = cur.iter().map(|c| char_width(*c)).sum();
+                    }
+                    _ => {
+                        out.push(cur.drain(..).collect());
+                        w = 0;
+                    }
+                }
+                brk = None;
+                if w + cw > width && !cur.is_empty() {
+                    out.push(cur.drain(..).collect());
+                    w = 0;
+                }
             }
             cur.push(c);
             w += cw;
+            if c == ' ' || cw > 1 {
+                brk = Some(cur.len());
+            }
         }
-        out.push(cur);
+        out.push(cur.into_iter().collect());
     }
     out
 }
@@ -275,6 +306,26 @@ mod tests {
         assert_eq!(wrap("日本語です", 4), vec!["日本", "語で", "す"]);
         assert_eq!(wrap("a\n\nb", 10), vec!["a", "", "b"]);
         assert_eq!(wrap("", 5), vec![""]);
+    }
+
+    #[test]
+    fn wrap_keeps_words_whole() {
+        assert_eq!(wrap("hello brave world", 11), vec!["hello brave", "world"]);
+        assert_eq!(wrap("hello world", 8), vec!["hello", "world"]);
+        // A word longer than the line is broken anywhere.
+        assert_eq!(wrap("a bcdefgh", 5), vec!["a", "bcdef", "gh"]);
+        assert_eq!(wrap("abcdef", 3), vec!["abc", "def"]);
+        // CJK breaks after any character, but a Latin word stays whole.
+        assert_eq!(wrap("これはtestです", 8), vec!["これは", "testです"]);
+        assert_eq!(wrap("日本語abc", 6), vec!["日本語", "abc"]);
+        // Leading spaces are kept; a line is never only spaces.
+        assert_eq!(wrap("  ab cd", 5), vec!["  ab", "cd"]);
+        assert_eq!(wrap(" abcdefg", 4), vec![" abc", "defg"]);
+        for w in 1..12 {
+            for l in wrap("The quick 茶色の fox jumps over 怠惰な dog", w) {
+                assert!(str_width(&l) <= w.max(2), "{w}: {l:?}");
+            }
+        }
         assert_eq!(
             wrap_prefixed("abcdef", 5, "> ", "  "),
             vec!["> abc", "  def"]

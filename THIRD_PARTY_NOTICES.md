@@ -40,3 +40,11 @@ koolie 自体は MIT License です（[LICENSE](LICENSE)）。ただし、次の
 ## herdr の API スキーマ（`docs/reference/herdr-api-schema-0.9.5.json`）
 
 herdr 0.9.5 で `herdr api schema --json` を実行した出力を、そのまま保存したものです。開発のときの参照用で、バイナリには入っていません。
+
+## Charm（見た目の参考）
+
+<https://charm.land/>、<https://github.com/charmbracelet/bubbletea>
+
+- 画面の見た目は、Charm の Lip Gloss / Bubbles / Huh の既定のスタイルに合わせました（色の値、一覧の選択の表し方、ヘルプ行の形、フォームの形）。
+- コードは取り込んでいません。使ったのは色の値（16 進数）だけで、`src/ui/theme.rs` にあります。
+- これらのライブラリは MIT License です。
