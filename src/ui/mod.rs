@@ -148,7 +148,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Some(Focus::Compose) => {
                 "Enter 送信  Alt+Enter 改行  Tab 画面/チャット  PgUp/PgDn スクロール  Ctrl+T スニペット  Esc 操作モード"
             }
-            _ => "i 入力  Tab 画面/チャット  a 端末へ  x 中断  j/k スクロール  Esc/q 一覧へ",
+            Some(Focus::Direct) => {
+                "直接操作中: キーはすべてエージェントへ送られます（Esc も）  Ctrl+G 戻る"
+            }
+            _ => {
+                "i 入力  p 直接操作  Tab 画面/チャット  a 端末へ  x 中断  j/k スクロール  Esc/q 一覧へ"
+            }
         },
         View::Hosts => match app.hosts_view.add {
             Some(AddStep::Choose { .. }) => {
@@ -365,11 +370,22 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if d.focus == Focus::View {
-            Color::Cyan
-        } else {
-            DIM
+        .border_style(Style::new().fg(match d.focus {
+            Focus::View => Color::Cyan,
+            Focus::Direct => Color::Green,
+            Focus::Compose => DIM,
         }));
+    let block = if d.focus == Focus::Direct {
+        block.title_top(
+            Line::from(Span::styled(
+                " 直接操作中 — Ctrl+G で戻る ",
+                Style::new().fg(Color::Black).bg(Color::Green).bold(),
+            ))
+            .right_aligned(),
+        )
+    } else {
+        block
+    };
     match d.mode {
         DetailMode::Peek => draw_peek(f, d, block, content),
         DetailMode::Chat => draw_chat(f, d, block, content),
@@ -990,6 +1006,10 @@ fn draw_help(f: &mut Frame, _app: &App, area: Rect) {
         ("i", "メッセージを書く（Enter 送信、Alt+Enter 改行）"),
         ("Tab", "画面 ⇄ チャット"),
         ("1-9 y n ↑↓ Enter", "入力待ちのとき、そのキーを直接送る"),
+        (
+            "p",
+            "直接操作: キーをすべてエージェントへ送る（Ctrl+G で戻る）",
+        ),
         ("x", "中断（Esc を送る）"),
         ("Ctrl+T / s", "スニペット"),
         ("Esc", "入力欄から操作モードへ / 一覧へ戻る"),

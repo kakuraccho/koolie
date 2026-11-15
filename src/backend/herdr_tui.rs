@@ -405,9 +405,19 @@ impl Backend for HerdrTui {
     }
 
     async fn send_keys(&self, id: &str, keys: &[String]) -> Result<()> {
-        self.call("pane.send_keys", json!({"pane_id": id, "keys": keys}))
-            .await
-            .map(|_| ())
+        for chunk in key_chunks(keys) {
+            match chunk {
+                KeyChunk::Keys(keys) => {
+                    self.call("pane.send_keys", json!({"pane_id": id, "keys": keys}))
+                        .await?;
+                }
+                KeyChunk::Text(text) => {
+                    self.call("pane.send_text", json!({"pane_id": id, "text": text}))
+                        .await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn insert_text(&self, id: &str, text: &str) -> Result<()> {
@@ -429,9 +439,64 @@ impl Backend for HerdrTui {
     }
 }
 
+/// Part of a key sequence: names `pane.send_keys` knows, or the bytes of
+/// keys it does not.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeyChunk {
+    Keys(Vec<String>),
+    Text(String),
+}
+
+/// The escape sequence for a key herdr 0.9.5's `pane.send_keys` rejects
+/// (`unsupported key home`). Only unmodified ones; `send_text` passes the
+/// bytes through as they are.
+fn unnamed_key_bytes(key: &str) -> Option<&'static str> {
+    Some(match key.to_ascii_lowercase().as_str() {
+        "home" => "\x1b[H",
+        "end" => "\x1b[F",
+        "insert" => "\x1b[2~",
+        "delete" => "\x1b[3~",
+        "pageup" => "\x1b[5~",
+        "pagedown" => "\x1b[6~",
+        _ => return None,
+    })
+}
+
+/// Split keys into `send_keys` runs and `send_text` bytes, keeping order.
+pub fn key_chunks(keys: &[String]) -> Vec<KeyChunk> {
+    let mut out: Vec<KeyChunk> = Vec::new();
+    for k in keys {
+        match (unnamed_key_bytes(k), out.last_mut()) {
+            (Some(b), Some(KeyChunk::Text(t))) => t.push_str(b),
+            (Some(b), _) => out.push(KeyChunk::Text(b.to_string())),
+            (None, Some(KeyChunk::Keys(v))) => v.push(k.clone()),
+            (None, _) => out.push(KeyChunk::Keys(vec![k.clone()])),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_herdr_cannot_name_go_as_bytes_in_order() {
+        let keys: Vec<String> = ["j", "home", "end", "k", "delete"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            key_chunks(&keys),
+            vec![
+                KeyChunk::Keys(vec!["j".into()]),
+                KeyChunk::Text("\x1b[H\x1b[F".into()),
+                KeyChunk::Keys(vec!["k".into()]),
+                KeyChunk::Text("\x1b[3~".into()),
+            ]
+        );
+        assert!(key_chunks(&[]).is_empty());
+    }
 
     /// A real `session.snapshot` result from herdr 0.9.5.
     const SNAPSHOT_095: &str = r#"{"snapshot":{"agents":[{"agent":"claude","agent_status":"working","cwd":"/home/u/dev","focused":true,"foreground_cwd":"/home/u/dev","pane_id":"wB:p1","revision":4,"state_change_seq":6,"tab_id":"wB:t1","terminal_id":"term_65ff90af2b6c11","terminal_title":"◐ Heeler for herdr TUIツール","terminal_title_stripped":"Heeler for herdr TUIツール","workspace_id":"wB"}],"focused_pane_id":"wB:p1","focused_tab_id":"wB:t1","focused_workspace_id":"wB","layouts":[],"panes":[],"protocol":22,"tabs":[],"version":"0.9.5","workspaces":[{"active_tab_id":"wB:t1","agent_status":"working","focused":true,"label":"dev","number":1,"pane_count":1,"tab_count":1,"workspace_id":"wB"}]},"type":"session_snapshot"}"#;
